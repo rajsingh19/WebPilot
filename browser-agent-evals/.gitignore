@@ -1,0 +1,24 @@
+# Environment and secrets
+.env
+
+# Execution traces
+traces/*
+!traces/.gitkeep
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Testing and cache
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
