@@ -101,7 +101,11 @@ def element_label(element: Any) -> str:
 
 
 def compute_page_state_hash(url: str, elements: Any = None) -> str:
-    """Computes a stable hash representing current page state from URL and element IDs/labels."""
+    """Computes a stable hash representing current page state.
+
+    Includes URL, element IDs, visible labels, truncated current values (up to 40 chars),
+    checked states, and disabled flags.
+    """
     clean_url = (url or "").strip()
     parts = [clean_url]
     if elements:
@@ -109,10 +113,19 @@ def compute_page_state_hash(url: str, elements: Any = None) -> str:
             if isinstance(el, dict):
                 el_id = str(el.get("id", ""))
                 lbl = element_label(el)
+                raw_val = el.get("value", "")
+                chk = bool(el.get("checked", False))
+                dis = bool(el.get("disabled", False))
             else:
                 el_id = str(getattr(el, "id", ""))
                 lbl = element_label(el)
-            parts.append(f"{el_id}:{lbl}")
+                raw_val = getattr(el, "value", "")
+                chk = bool(getattr(el, "checked", False))
+                dis = bool(getattr(el, "disabled", False))
+
+            val_trunc = str(raw_val or "")[:40]
+            parts.append(f"{el_id}:{lbl}:{val_trunc}:{chk}:{dis}")
+
     raw = "|".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 

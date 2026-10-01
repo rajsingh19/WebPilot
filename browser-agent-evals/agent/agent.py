@@ -1,1 +1,550 @@
-""""""
+"""Browser agent orchestrator coordinating browser sessions, LLM decisions, and guardrails."""
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+import json
+import logging
+import os
+from pathlib import Path
+import time
+from typing import Any, Callable, Dict, List, Optional
+import uuid
+
+from agent.browser import BrowserSession, Observation, to_prompt_text
+from agent.guardrails import (
+    LoopDetector,
+    StepLimiter,
+    check_action,
+    compute_page_state_hash,
+    element_label,
+)
+from agent.llm import LLMError, decide, estimate_cost
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RunResult:
+    """Structured result returned at the conclusion of an agent execution run."""
+
+    status: str
+    steps: int
+    total_tokens: int
+    estimated_cost_usd: float
+    duration_s: float
+    final_url: str
+    trace_dir: str
+    summary: str
+    question: Optional[str] = None
+    trace_file: Optional[str] = None
+
+
+@dataclass
+class StepRecord:
+    """Record of a single step executed during an agent run."""
+
+    step: int
+    url: str
+    screenshot_path: Optional[str]
+    elements_count: int
+    page_state_hash: str
+    reasoning: str
+    action: str
+    args: Dict[str, Any]
+    result: str
+    input_tokens: int
+    output_tokens: int
+    latency_ms: int
+
+
+class Agent:
+    """Autonomous web agent executing goals in a browser with safety guardrails."""
+
+    def __init__(
+        self,
+        provider: Optional[str] = None,
+        model_name: Optional[str] = None,
+        browser_session: Optional[BrowserSession] = None,
+        headless: bool = True,
+        max_steps: int = 12,
+        max_wall_time: float = 120.0,
+        traces_root: str = "traces",
+    ) -> None:
+        self.provider = provider or os.getenv("PROVIDER", "anthropic")
+        self.model_name = model_name or os.getenv("MODEL_NAME", "claude-3-5-sonnet-20241022")
+        self.browser_session = browser_session
+        self.headless = headless
+        self.max_steps = max_steps
+        self.max_wall_time = max_wall_time
+        self.traces_root = Path(traces_root)
+        self._owned_session: bool = False
+
+    def _get_or_create_session(self) -> BrowserSession:
+        """Retrieves the active session or starts an owned session."""
+        if self.browser_session is not None:
+            if self.browser_session._page is None:
+                self.browser_session.start()
+            return self.browser_session
+
+        session = BrowserSession(headless=self.headless)
+        session.start()
+        self.browser_session = session
+        self._owned_session = True
+        return session
+
+    def close(self) -> None:
+        """Closes the browser session if it was instantiated by the agent."""
+        if self.browser_session is not None:
+            self.browser_session.close()
+
+    def run(
+        self,
+        goal: str,
+        start_url: str,
+        confirm_callback: Optional[Callable[[str], bool]] = None,
+    ) -> RunResult:
+        """Executes the agent loop to achieve the given goal starting from start_url.
+
+        Loop order:
+            observe -> llm.decide -> guardrails.check_action -> execute -> record trace -> repeat.
+
+        Never raises an exception; all errors are caught and returned as RunResult(status="error").
+        The browser session is kept open so callers and evaluators can inspect live state.
+        """
+        run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        run_trace_dir = self.traces_root / run_id
+        run_trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_json_path = run_trace_dir / "trace.json"
+
+        start_time = time.monotonic()
+        total_input_tokens = 0
+        total_output_tokens = 0
+        step_records: List[StepRecord] = []
+        history_entries: List[Dict[str, Any]] = []
+        hallucinated_ids = 0
+        blocked_attempts = 0
+
+        loop_detector = LoopDetector(tuple_threshold=3, state_threshold=4)
+        step_limiter = StepLimiter(max_steps=self.max_steps, max_wall_time=self.max_wall_time)
+
+        final_status = "failed"
+        final_summary = "Run terminated without conclusion."
+        asked_question: Optional[str] = None
+        current_url = start_url
+
+        try:
+            session = self._get_or_create_session()
+            if start_url:
+                logger.info("Navigating to start URL: %s", start_url)
+                nav_res = session.goto(start_url)
+                if not nav_res.ok:
+                    logger.warning("Failed navigating to start_url: %s", nav_res.message)
+
+            step_no = 0
+            while True:
+                step_no += 1
+                limit_verdict = step_limiter.step()
+                if limit_verdict.exceeded:
+                    if "Time limit" in limit_verdict.reason:
+                        final_status = "timeout"
+                    else:
+                        final_status = "failed"
+                    final_summary = limit_verdict.reason
+                    break
+
+                # 1. Observe current page
+                screenshot_filename = f"step_{step_no}.png"
+                screenshot_file_path = run_trace_dir / screenshot_filename
+                obs = session.observe(screenshot_path=str(screenshot_file_path))
+                current_url = obs.url or current_url
+
+                # Compute page state hash for loop detection
+                page_state_hash = compute_page_state_hash(obs.url, obs.elements)
+
+                # Format prompt representation
+                observation_prompt_text = to_prompt_text(obs)
+
+                # 2. LLM Decision
+                llm_start = time.monotonic()
+                try:
+                    decision = decide(
+                        goal=goal,
+                        history=history_entries,
+                        observation_text=observation_prompt_text,
+                        model_name=self.model_name,
+                        provider=self.provider,
+                    )
+                except LLMError as exc:
+                    final_status = "error"
+                    final_summary = f"LLM error: {exc}"
+                    logger.error("LLM decision error: %s", exc)
+                    break
+
+                llm_latency_ms = int((time.monotonic() - llm_start) * 1000)
+                total_input_tokens += decision.input_tokens
+                total_output_tokens += decision.output_tokens
+
+                action_name = decision.tool_name
+                action_args = decision.tool_args
+                action_reasoning = decision.reasoning
+
+                # 3. Handle finish action
+                if action_name == "finish":
+                    is_success = bool(action_args.get("success", False))
+                    final_status = "success" if is_success else "failed"
+                    final_summary = str(action_args.get("summary", "Task completed via finish tool."))
+                    step_records.append(
+                        StepRecord(
+                            step=step_no,
+                            url=obs.url,
+                            screenshot_path=str(screenshot_file_path),
+                            elements_count=len(obs.elements),
+                            page_state_hash=page_state_hash,
+                            reasoning=action_reasoning,
+                            action=action_name,
+                            args=action_args,
+                            result=final_summary,
+                            input_tokens=decision.input_tokens,
+                            output_tokens=decision.output_tokens,
+                            latency_ms=llm_latency_ms,
+                        )
+                    )
+                    break
+
+                # 4. Handle ask_user action
+                if action_name == "ask_user":
+                    question = str(action_args.get("question", ""))
+                    asked_question = question
+                    if confirm_callback is None:
+                        final_status = "needs_confirmation"
+                        final_summary = f"Agent paused for user confirmation: {question}"
+                        step_records.append(
+                            StepRecord(
+                                step=step_no,
+                                url=obs.url,
+                                screenshot_path=str(screenshot_file_path),
+                                elements_count=len(obs.elements),
+                                page_state_hash=page_state_hash,
+                                reasoning=action_reasoning,
+                                action=action_name,
+                                args=action_args,
+                                result=final_summary,
+                                input_tokens=decision.input_tokens,
+                                output_tokens=decision.output_tokens,
+                                latency_ms=llm_latency_ms,
+                            )
+                        )
+                        break
+                    else:
+                        confirmed = confirm_callback(question)
+                        if not confirmed:
+                            final_status = "blocked"
+                            final_summary = f"User denied confirmation for: {question}"
+                            step_records.append(
+                                StepRecord(
+                                    step=step_no,
+                                    url=obs.url,
+                                    screenshot_path=str(screenshot_file_path),
+                                    elements_count=len(obs.elements),
+                                    page_state_hash=page_state_hash,
+                                    reasoning=action_reasoning,
+                                    action=action_name,
+                                    args=action_args,
+                                    result=final_summary,
+                                    input_tokens=decision.input_tokens,
+                                    output_tokens=decision.output_tokens,
+                                    latency_ms=llm_latency_ms,
+                                )
+                            )
+                            break
+                        else:
+                            action_result_msg = f"User confirmed question: '{question}'."
+                            history_entries.append(
+                                {
+                                    "action": f"ask_user({question})",
+                                    "result": "User confirmed. Proceeding.",
+                                }
+                            )
+                            step_records.append(
+                                StepRecord(
+                                    step=step_no,
+                                    url=obs.url,
+                                    screenshot_path=str(screenshot_file_path),
+                                    elements_count=len(obs.elements),
+                                    page_state_hash=page_state_hash,
+                                    reasoning=action_reasoning,
+                                    action=action_name,
+                                    args=action_args,
+                                    result=action_result_msg,
+                                    input_tokens=decision.input_tokens,
+                                    output_tokens=decision.output_tokens,
+                                    latency_ms=llm_latency_ms,
+                                )
+                            )
+                            continue
+
+                # 5. Check for hallucinated element ID
+                target_element = None
+                if action_name in ("click", "type_text"):
+                    target_id = action_args.get("id")
+                    if target_id is not None:
+                        matched = [el for el in obs.elements if el.id == int(target_id)]
+                        if not matched:
+                            hallucinated_ids += 1
+                            err_msg = f"Invalid element id [{target_id}] does not exist on page."
+                            logger.warning(err_msg)
+                            history_entries.append(
+                                {
+                                    "action": f"{action_name}({action_args})",
+                                    "result": f"Failed: {err_msg}",
+                                }
+                            )
+                            step_records.append(
+                                StepRecord(
+                                    step=step_no,
+                                    url=obs.url,
+                                    screenshot_path=str(screenshot_file_path),
+                                    elements_count=len(obs.elements),
+                                    page_state_hash=page_state_hash,
+                                    reasoning=action_reasoning,
+                                    action=action_name,
+                                    args=action_args,
+                                    result=err_msg,
+                                    input_tokens=decision.input_tokens,
+                                    output_tokens=decision.output_tokens,
+                                    latency_ms=llm_latency_ms,
+                                )
+                            )
+                            continue
+                        target_element = matched[0]
+
+                # 6. Safety Guardrail Check
+                target_label = element_label(target_element) if target_element else ""
+                press_enter_flag = bool(action_args.get("press_enter", False))
+                guard_verdict = check_action(
+                    action=action_name,
+                    element=target_label,
+                    url=obs.url,
+                    press_enter=press_enter_flag,
+                )
+
+                if not guard_verdict.allowed:
+                    blocked_attempts += 1
+                    logger.warning("Guardrail blocked action: %s", guard_verdict.reason)
+                    history_entries.append(
+                        {
+                            "action": f"{action_name}({action_args})",
+                            "result": (
+                                f"BLOCKED: {guard_verdict.reason}. "
+                                "You must call ask_user instead before performing this action."
+                            ),
+                        }
+                    )
+                    step_records.append(
+                        StepRecord(
+                            step=step_no,
+                            url=obs.url,
+                            screenshot_path=str(screenshot_file_path),
+                            elements_count=len(obs.elements),
+                            page_state_hash=page_state_hash,
+                            reasoning=action_reasoning,
+                            action=action_name,
+                            args=action_args,
+                            result=f"BLOCKED: {guard_verdict.reason}",
+                            input_tokens=decision.input_tokens,
+                            output_tokens=decision.output_tokens,
+                            latency_ms=llm_latency_ms,
+                        )
+                    )
+
+                    if blocked_attempts >= 2:
+                        final_status = "blocked"
+                        final_summary = (
+                            f"Execution stopped: action blocked 2 times by guardrails ({guard_verdict.reason})."
+                        )
+                        break
+                    continue
+
+                # 7. Check Loop Detection with page_state_hash
+                loop_verdict = loop_detector.record(
+                    url=obs.url,
+                    action=action_name,
+                    args=action_args,
+                    page_state_hash=page_state_hash,
+                )
+                if loop_verdict.is_loop:
+                    final_status = "loop"
+                    final_summary = loop_verdict.reason
+                    step_records.append(
+                        StepRecord(
+                            step=step_no,
+                            url=obs.url,
+                            screenshot_path=str(screenshot_file_path),
+                            elements_count=len(obs.elements),
+                            page_state_hash=page_state_hash,
+                            reasoning=action_reasoning,
+                            action=action_name,
+                            args=action_args,
+                            result=f"LOOP DETECTED: {loop_verdict.reason}",
+                            input_tokens=decision.input_tokens,
+                            output_tokens=decision.output_tokens,
+                            latency_ms=llm_latency_ms,
+                        )
+                    )
+                    break
+
+                # 8. Execute Browser Action
+                action_result_str = ""
+                if action_name == "click":
+                    res = session.click(id=int(action_args["id"]))
+                    action_result_str = res.message
+                elif action_name == "type_text":
+                    res = session.type_text(
+                        id=int(action_args["id"]),
+                        text=str(action_args["text"]),
+                        press_enter=bool(action_args.get("press_enter", False)),
+                    )
+                    action_result_str = res.message
+                elif action_name == "goto":
+                    res = session.goto(url=str(action_args["url"]))
+                    action_result_str = res.message
+                elif action_name == "scroll":
+                    res = session.scroll(direction=str(action_args.get("direction", "down")))
+                    action_result_str = res.message
+                elif action_name == "go_back":
+                    res = session.go_back()
+                    action_result_str = res.message
+                elif action_name == "wait":
+                    res = session.wait(seconds=float(action_args.get("seconds", 2)))
+                    action_result_str = res.message
+                else:
+                    action_result_str = f"Unknown action: {action_name}"
+
+                history_entries.append(
+                    {
+                        "action": f"{action_name}({action_args})",
+                        "result": action_result_str,
+                    }
+                )
+
+                step_records.append(
+                    StepRecord(
+                        step=step_no,
+                        url=obs.url,
+                        screenshot_path=str(screenshot_file_path),
+                        elements_count=len(obs.elements),
+                        page_state_hash=page_state_hash,
+                        reasoning=action_reasoning,
+                        action=action_name,
+                        args=action_args,
+                        result=action_result_str,
+                        input_tokens=decision.input_tokens,
+                        output_tokens=decision.output_tokens,
+                        latency_ms=llm_latency_ms,
+                    )
+                )
+
+        except Exception as exc:
+            logger.exception("Unexpected exception in Agent.run(): %s", exc)
+            final_status = "error"
+            final_summary = f"Unexpected error during execution: {exc}"
+
+        duration_s = round(time.monotonic() - start_time, 2)
+        total_tokens = total_input_tokens + total_output_tokens
+        cost_usd = estimate_cost(self.model_name, total_input_tokens, total_output_tokens)
+
+        # Write trace.json
+        trace_data = {
+            "run_id": run_id,
+            "goal": goal,
+            "start_url": start_url,
+            "provider": self.provider,
+            "model": self.model_name,
+            "status": final_status,
+            "summary": final_summary,
+            "question": asked_question,
+            "total_steps": len(step_records),
+            "duration_s": duration_s,
+            "total_tokens": total_tokens,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "estimated_cost_usd": cost_usd,
+            "hallucinated_ids_count": hallucinated_ids,
+            "steps": [asdict(record) for record in step_records],
+        }
+
+        try:
+            with open(trace_json_path, "w", encoding="utf-8") as f:
+                json.dump(trace_data, f, indent=2)
+        except Exception as exc:
+            logger.error("Failed to write trace file: %s", exc)
+
+        return RunResult(
+            status=final_status,
+            steps=len(step_records),
+            total_tokens=total_tokens,
+            estimated_cost_usd=cost_usd,
+            duration_s=duration_s,
+            final_url=current_url,
+            trace_dir=str(run_trace_dir),
+            summary=final_summary,
+            question=asked_question,
+            trace_file=str(trace_json_path),
+        )
+
+
+if __name__ == "__main__":
+    import argparse
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    parser = argparse.ArgumentParser(description="WebPilot Autonomous Browser Agent")
+    parser.add_argument("--goal", type=str, required=True, help="Goal for the browser agent")
+    parser.add_argument("--url", type=str, required=True, help="Starting URL")
+    parser.add_argument("--headed", action="store_true", help="Launch browser in headed mode")
+    parser.add_argument("--provider", type=str, default=None, help="LLM Provider (anthropic, gemini, grok)")
+    parser.add_argument("--model", type=str, default=None, help="Model name")
+    parser.add_argument("--max-steps", type=int, default=12, help="Maximum execution steps")
+
+    args = parser.parse_args()
+    console = Console()
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]WebPilot Browser Agent[/bold cyan]\n"
+            f"[yellow]Goal:[/yellow] {args.goal}\n"
+            f"[yellow]URL:[/yellow] {args.url}\n"
+            f"[yellow]Headed:[/yellow] {args.headed}",
+            border_style="cyan",
+        )
+    )
+
+    agent = Agent(
+        provider=args.provider,
+        model_name=args.model,
+        headless=not args.headed,
+        max_steps=args.max_steps,
+    )
+
+    try:
+        result = agent.run(goal=args.goal, start_url=args.url)
+
+        table = Table(title="Execution Summary", border_style="green")
+        table.add_column("Field", style="bold")
+        table.add_column("Value")
+
+        table.add_row("Status", f"[{'green' if result.status == 'success' else 'red'}]{result.status}[/]")
+        table.add_row("Steps Executed", str(result.steps))
+        table.add_row("Duration", f"{result.duration_s}s")
+        table.add_row("Total Tokens", str(result.total_tokens))
+        table.add_row("Estimated Cost", f"${result.estimated_cost_usd:.4f}")
+        table.add_row("Final URL", result.final_url)
+        table.add_row("Trace Directory", result.trace_dir)
+        table.add_row("Summary", result.summary)
+        if result.question:
+            table.add_row("Question for User", result.question)
+
+        console.print(table)
+    finally:
+        agent.close()

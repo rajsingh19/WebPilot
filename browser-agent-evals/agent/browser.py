@@ -19,6 +19,7 @@ class InteractiveElement:
     text: str = ""
     value: str = ""
     disabled: bool = False
+    checked: bool = False
 
 
 @dataclass
@@ -107,6 +108,11 @@ JS_EXTRACT_ELEMENTS = """
         }
 
         const disabled = Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
+        const checked = Boolean(
+            el.checked ||
+            el.getAttribute('aria-checked') === 'true' ||
+            el.getAttribute('aria-selected') === 'true'
+        );
 
         items.push({
             id: id,
@@ -114,7 +120,8 @@ JS_EXTRACT_ELEMENTS = """
             type: type,
             text: text,
             value: value,
-            disabled: disabled
+            disabled: disabled,
+            checked: checked
         });
 
         if (items.length >= 80) {
@@ -147,6 +154,8 @@ def to_prompt_text(observation: Observation) -> str:
             parts.append(f"'{el.text}'")
         if el.value:
             parts.append(f"value='{el.value}'")
+        if el.checked:
+            parts.append("[checked]")
         if el.disabled:
             parts.append("[disabled]")
         lines.append(" ".join(parts))
@@ -243,6 +252,7 @@ class BrowserSession:
                         text=str(item.get("text", "")),
                         value=str(item.get("value", "")),
                         disabled=bool(item.get("disabled", False)),
+                        checked=bool(item.get("checked", False)),
                     )
                 )
 

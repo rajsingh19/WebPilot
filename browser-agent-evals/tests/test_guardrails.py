@@ -249,6 +249,94 @@ class TestLoopDetector:
         assert h1 == h2
         assert h1 != h3
 
+    def test_typing_into_4_fields_values_changing_not_stagnation(self):
+        """Typing into 4 different fields one after another (values changing) is NOT flagged as stagnation."""
+        detector = LoopDetector(tuple_threshold=3, state_threshold=4)
+        url = "https://example.com/checkout"
+
+        # Step 1: type first name
+        h1 = compute_page_state_hash(
+            url,
+            [
+                {"id": 1, "text": "First Name", "value": "Jane"},
+                {"id": 2, "text": "Last Name", "value": ""},
+                {"id": 3, "text": "Email", "value": ""},
+                {"id": 4, "text": "Zip Code", "value": ""},
+            ],
+        )
+        v1 = detector.record(url, "type_text", {"id": 1, "text": "Jane"}, page_state_hash=h1)
+        assert not v1.is_loop
+
+        # Step 2: type last name
+        h2 = compute_page_state_hash(
+            url,
+            [
+                {"id": 1, "text": "First Name", "value": "Jane"},
+                {"id": 2, "text": "Last Name", "value": "Doe"},
+                {"id": 3, "text": "Email", "value": ""},
+                {"id": 4, "text": "Zip Code", "value": ""},
+            ],
+        )
+        v2 = detector.record(url, "type_text", {"id": 2, "text": "Doe"}, page_state_hash=h2)
+        assert not v2.is_loop
+
+        # Step 3: type email
+        h3 = compute_page_state_hash(
+            url,
+            [
+                {"id": 1, "text": "First Name", "value": "Jane"},
+                {"id": 2, "text": "Last Name", "value": "Doe"},
+                {"id": 3, "text": "Email", "value": "jane@example.com"},
+                {"id": 4, "text": "Zip Code", "value": ""},
+            ],
+        )
+        v3 = detector.record(url, "type_text", {"id": 3, "text": "jane@example.com"}, page_state_hash=h3)
+        assert not v3.is_loop
+
+        # Step 4: type zip code
+        h4 = compute_page_state_hash(
+            url,
+            [
+                {"id": 1, "text": "First Name", "value": "Jane"},
+                {"id": 2, "text": "Last Name", "value": "Doe"},
+                {"id": 3, "text": "Email", "value": "jane@example.com"},
+                {"id": 4, "text": "Zip Code", "value": "94105"},
+            ],
+        )
+        v4 = detector.record(url, "type_text", {"id": 4, "text": "94105"}, page_state_hash=h4)
+        assert not v4.is_loop, "Typing into 4 fields with changing values must not be flagged as stagnation"
+
+    def test_ticking_checkbox_changes_hash(self):
+        """Ticking a checkbox modifies the computed page_state_hash."""
+        url = "https://example.com/settings"
+        unchecked_elements = [
+            {"id": 1, "text": "Subscribe to newsletter", "checked": False},
+            {"id": 2, "text": "Accept terms", "checked": False},
+        ]
+        checked_elements = [
+            {"id": 1, "text": "Subscribe to newsletter", "checked": True},
+            {"id": 2, "text": "Accept terms", "checked": False},
+        ]
+
+        h_unchecked = compute_page_state_hash(url, unchecked_elements)
+        h_checked = compute_page_state_hash(url, checked_elements)
+
+        assert h_unchecked != h_checked, "Ticking a checkbox must produce a different page state hash"
+
+    def test_value_truncation_to_40_chars(self):
+        """Values past 40 characters are truncated when hashing page state."""
+        url = "https://example.com"
+        el_40 = [{"id": 1, "text": "Input", "value": "A" * 40}]
+        el_50 = [{"id": 1, "text": "Input", "value": "A" * 50}]
+        el_diff = [{"id": 1, "text": "Input", "value": "B" * 40}]
+
+        h_40 = compute_page_state_hash(url, el_40)
+        h_50 = compute_page_state_hash(url, el_50)
+        h_diff = compute_page_state_hash(url, el_diff)
+
+        assert h_40 == h_50, "Values past 40 characters must be truncated"
+        assert h_40 != h_diff
+
     def test_detector_reset(self):
         detector = LoopDetector(tuple_threshold=2)
         detector.record("https://site.com", "click", {"id": 1}, page_state_hash="h1")
