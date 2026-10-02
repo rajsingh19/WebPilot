@@ -65,6 +65,7 @@ class RunResult:
     has_real_cost: bool = False
     upstream_provider: Optional[str] = None
     navigation_error: Optional[str] = None
+    finish_converted_to_confirmation: bool = False
 
 
 @dataclass
@@ -198,6 +199,7 @@ class Agent:
                     "output_tokens": 0,
                     "estimated_cost_usd": 0.0,
                     "hallucinated_ids_count": 0,
+                    "finish_converted_to_confirmation": False,
                     "steps": [],
                 }
                 try:
@@ -266,6 +268,7 @@ class Agent:
         total_llm_calls = 0
         has_real_cost = False
         latest_upstream_provider: Optional[str] = None
+        finish_converted_to_confirmation = False
 
         try:
             session = self._get_or_create_session()
@@ -458,6 +461,35 @@ class Agent:
 
                 # 3. Handle finish action
                 if action_name == "finish":
+                    curr_url_lower = (obs.url or "").lower()
+                    if any(pat in curr_url_lower for pat in ("checkout-step-two", "payment", "review")):
+                        finish_converted_to_confirmation = True
+                        final_status = "needs_confirmation"
+                        asked_question = "Order is ready to place. Confirm?"
+                        final_summary = f"Agent paused for user confirmation: {asked_question}"
+                        logger.info(
+                            "Finish intercepted on URL '%s' matching checkout-step-two/payment/review; converting to needs_confirmation.",
+                            obs.url,
+                        )
+                        step_records.append(
+                            StepRecord(
+                                step=step_no,
+                                url=obs.url,
+                                screenshot_path=str(screenshot_file_path),
+                                elements_count=len(obs.elements),
+                                page_state_hash=page_state_hash,
+                                reasoning=action_reasoning,
+                                action=action_name,
+                                args=action_args,
+                                result="finish_converted_to_confirmation",
+                                input_tokens=decision.input_tokens,
+                                output_tokens=decision.output_tokens,
+                                latency_ms=llm_latency_ms,
+                                upstream_provider=step_upstream,
+                            )
+                        )
+                        break
+
                     is_success = bool(action_args.get("success", False))
                     final_status = "success" if is_success else "failed"
                     final_summary = str(action_args.get("summary", "Task completed via finish tool."))
@@ -769,6 +801,7 @@ class Agent:
             "llm_calls": total_llm_calls,
             "has_real_cost": has_real_cost,
             "navigation_error": navigation_error,
+            "finish_converted_to_confirmation": finish_converted_to_confirmation,
             "steps": [asdict(record) for record in step_records],
         }
 
@@ -801,6 +834,7 @@ class Agent:
             has_real_cost=has_real_cost,
             upstream_provider=latest_upstream_provider,
             navigation_error=navigation_error,
+            finish_converted_to_confirmation=finish_converted_to_confirmation,
         )
 
 

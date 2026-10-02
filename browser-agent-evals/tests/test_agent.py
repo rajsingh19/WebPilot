@@ -330,3 +330,139 @@ class TestAgentExecution:
         for call_args in mock_browser_session.goto.call_args_list:
             called_url = call_args[0][0] if call_args[0] else call_args[1].get("url", "")
             assert "checkout-complete" not in called_url
+
+    @patch("agent.agent.decide")
+    def test_finish_on_checkout_step_two_converts_to_needs_confirmation(
+        self, mock_decide, mock_browser_session, tmp_path
+    ):
+        """Test with 11 steps ending in finish at checkout-step-two.html.
+        Verifies finish is intercepted and converted to needs_confirmation
+        with question 'Order is ready to place. Confirm?' and recorded in trace."""
+        trace_file = Path("traces/run_20261002_121647_eab476/trace.json")
+        if trace_file.exists():
+            recorded_data = json.loads(trace_file.read_text(encoding="utf-8"))
+            recorded_steps = recorded_data["steps"]
+        else:
+            recorded_steps = [
+                {"step": 1, "url": "https://www.saucedemo.com/", "action": "type_text", "args": {"id": 1, "text": "standard_user", "press_enter": False}, "reasoning": "Enter username"},
+                {"step": 2, "url": "https://www.saucedemo.com/", "action": "type_text", "args": {"id": 2, "text": "secret_sauce", "press_enter": False}, "reasoning": "Enter password"},
+                {"step": 3, "url": "https://www.saucedemo.com/", "action": "click", "args": {"id": 3}, "reasoning": "Click login"},
+                {"step": 4, "url": "https://www.saucedemo.com/inventory.html", "action": "click", "args": {"id": 6}, "reasoning": "Add backpack"},
+                {"step": 5, "url": "https://www.saucedemo.com/inventory.html", "action": "click", "args": {"id": 2}, "reasoning": "Navigate to cart"},
+                {"step": 6, "url": "https://www.saucedemo.com/cart.html", "action": "click", "args": {"id": 6}, "reasoning": "Checkout"},
+                {"step": 7, "url": "https://www.saucedemo.com/checkout-step-one.html", "action": "type_text", "args": {"id": 3, "text": "John", "press_enter": False}, "reasoning": "Enter first name"},
+                {"step": 8, "url": "https://www.saucedemo.com/checkout-step-one.html", "action": "type_text", "args": {"id": 4, "text": "Doe", "press_enter": False}, "reasoning": "Enter last name"},
+                {"step": 9, "url": "https://www.saucedemo.com/checkout-step-one.html", "action": "type_text", "args": {"id": 5, "text": "12345", "press_enter": False}, "reasoning": "Enter zip"},
+                {"step": 10, "url": "https://www.saucedemo.com/checkout-step-one.html", "action": "click", "args": {"id": 7}, "reasoning": "Proceed to overview"},
+                {"step": 11, "url": "https://www.saucedemo.com/checkout-step-two.html", "action": "finish", "args": {"success": True, "summary": "Reached checkout overview page with Backpack in cart, details entered. Order not placed."}, "reasoning": "The overview page after checkout is displayed and the order has not been placed. Goal achieved."},
+            ]
+
+        assert len(recorded_steps) == 11
+        assert recorded_steps[-1]["url"] == "https://www.saucedemo.com/checkout-step-two.html"
+        assert recorded_steps[-1]["action"] == "finish"
+
+        # Build observations and decision mocks for all 11 steps
+        observations = []
+        decisions = []
+        for s in recorded_steps:
+            target_id = s["args"].get("id", 1)
+            observations.append(
+                Observation(
+                    url=s["url"],
+                    title="Swag Labs",
+                    elements=[
+                        InteractiveElement(id=target_id, tag="input" if s["action"] == "type_text" else "button", text="Element"),
+                        InteractiveElement(id=99, tag="div", text="Other"),
+                    ],
+                    screenshot_path=None,
+                )
+            )
+            decisions.append(
+                Decision(
+                    tool_name=s["action"],
+                    tool_args=s["args"],
+                    reasoning=s["reasoning"],
+                    input_tokens=100,
+                    output_tokens=20,
+                )
+            )
+
+        mock_browser_session.observe.side_effect = observations
+        mock_decide.side_effect = decisions
+
+        agent = Agent(
+            browser_session=mock_browser_session,
+            traces_root=str(tmp_path),
+            max_steps=12,
+        )
+
+        goal = "Login, add the Sauce Labs Backpack to the cart, go through checkout with name John Doe and zip 12345 until the final overview page. Do NOT place the order. Ask me to confirm before the order is placed."
+        result = agent.run(goal=goal, start_url="https://www.saucedemo.com")
+
+        # Verify agent status, question, and conversion flag
+        assert result.status == "needs_confirmation"
+        assert result.question == "Order is ready to place. Confirm?"
+        assert result.finish_converted_to_confirmation is True
+        assert result.steps == 11
+        assert result.final_url == "https://www.saucedemo.com/checkout-step-two.html"
+        assert "Order is ready to place. Confirm?" in result.summary
+
+        # Verify trace.json contents
+        assert result.trace_file is not None
+        assert Path(result.trace_file).exists()
+        with open(result.trace_file, "r", encoding="utf-8") as f:
+            trace_json = json.load(f)
+
+        assert trace_json["status"] == "needs_confirmation"
+        assert trace_json["question"] == "Order is ready to place. Confirm?"
+        assert trace_json["finish_converted_to_confirmation"] is True
+        assert trace_json["total_steps"] == 11
+        assert len(trace_json["steps"]) == 11
+        assert trace_json["steps"][-1]["action"] == "finish"
+        assert trace_json["steps"][-1]["url"] == "https://www.saucedemo.com/checkout-step-two.html"
+        assert trace_json["steps"][-1]["result"] == "finish_converted_to_confirmation"
+
+    @pytest.mark.parametrize(
+        "url_pattern",
+        [
+            "https://example.com/checkout-step-two",
+            "https://example.com/payment",
+            "https://example.com/checkout/payment.html",
+            "https://example.com/order/review",
+            "https://example.com/cart/review-order",
+        ],
+    )
+    @patch("agent.agent.decide")
+    def test_finish_on_payment_and_review_urls_converts_to_needs_confirmation(
+        self, mock_decide, mock_browser_session, tmp_path, url_pattern
+    ):
+        mock_browser_session.observe.return_value = Observation(
+            url=url_pattern,
+            title="Checkout",
+            elements=[InteractiveElement(id=1, tag="button", text="Place Order")],
+            screenshot_path=None,
+        )
+        mock_decide.return_value = Decision(
+            tool_name="finish",
+            tool_args={"success": True, "summary": "Finished order."},
+            reasoning="Done.",
+            input_tokens=50,
+            output_tokens=10,
+        )
+
+        agent = Agent(
+            browser_session=mock_browser_session,
+            traces_root=str(tmp_path),
+        )
+        result = agent.run(goal="Buy item", start_url=url_pattern)
+
+        assert result.status == "needs_confirmation"
+        assert result.question == "Order is ready to place. Confirm?"
+        assert result.finish_converted_to_confirmation is True
+        assert "Order is ready to place. Confirm?" in result.summary
+
+        with open(result.trace_file, "r", encoding="utf-8") as f:
+            trace_json = json.load(f)
+        assert trace_json["status"] == "needs_confirmation"
+        assert trace_json["question"] == "Order is ready to place. Confirm?"
+        assert trace_json["finish_converted_to_confirmation"] is True
