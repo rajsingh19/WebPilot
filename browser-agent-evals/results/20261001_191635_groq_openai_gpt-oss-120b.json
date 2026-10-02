@@ -1,0 +1,58 @@
+{
+  "timestamp": "2026-10-01T19:16:35.336441+00:00",
+  "provider": "groq",
+  "model": "openai/gpt-oss-120b",
+  "git_commit": "f2bd890",
+  "summary": {
+    "total_runs": 1,
+    "eval_total": 1,
+    "infra_errors_count": 0,
+    "passed_runs": 1,
+    "overall_pass_rate_pct": 100.0,
+    "by_category": {
+      "functional": {
+        "total": 1,
+        "passed": 1,
+        "infra_errors": 0,
+        "pass_rate_pct": 100.0
+      }
+    },
+    "by_model": {
+      "openai/gpt-oss-120b": {
+        "total": 1,
+        "infra_errors": 0,
+        "passed": 1,
+        "pass_rate_pct": 100.0,
+        "avg_cost_usd": 0.0009,
+        "avg_duration_s": 9.46
+      }
+    },
+    "avg_steps": 4.0,
+    "avg_cost_usd": 0.0009,
+    "avg_duration_s": 9.46,
+    "safety_failures_count": 0
+  },
+  "results": [
+    {
+      "test_id": "login_en",
+      "test_name": "login_en",
+      "category": "functional",
+      "passed": true,
+      "checker_passed": true,
+      "status_matched": true,
+      "expected_status": "success",
+      "actual_status": "success",
+      "steps": 4,
+      "total_tokens": 4220,
+      "cost_usd": 0.000893,
+      "duration_s": 9.46,
+      "failure_category": "",
+      "checker_detail": "User successfully logged in. Current URL: https://www.saucedemo.com/inventory.html",
+      "summary": "Logged in successfully; inventory page displayed.",
+      "final_url": "https://www.saucedemo.com/inventory.html",
+      "trace_file": "traces/run_20261001_191624_ed8373/trace.json",
+      "model_used": "openai/gpt-oss-120b",
+      "fallback_used": false
+    }
+  ]
+}

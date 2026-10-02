@@ -160,7 +160,80 @@ class TestElementLabelAndCheckAction:
     def test_non_interactive_actions_allowed(self):
         assert check_action("scroll", element_text="pay now").allowed
         assert check_action("wait", element_text="delete all").allowed
-        assert check_action("goto", url="https://example.com/pay").allowed
+        assert check_action("goto", url="https://example.com/cart.html").allowed
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.saucedemo.com/checkout-complete.html",
+            "https://example.com/checkout-complete",
+            "https://example.com/order-complete",
+            "https://example.com/pay",
+            "https://example.com/pay/",
+            "https://example.com/payment",
+            "https://example.com/confirm",
+            "https://example.com/order/confirm",
+            "/checkout-complete",
+            "/order-complete",
+            "/pay",
+            "/pay/",
+            "/payment",
+            "/confirm",
+        ],
+    )
+    def test_goto_blocked_paths(self, url: str):
+        verdict = check_action("goto", url=url)
+        assert not verdict.allowed
+        assert "blocked risky goto navigation" in verdict.reason.lower()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.saucedemo.com/cart.html",
+            "https://www.saucedemo.com/inventory.html",
+            "https://example.com/cart.html",
+            "https://example.com/inventory.html",
+            "https://example.com/products",
+            "https://example.com/checkout-step-one.html",
+            "https://example.com/checkout-step-two.html",
+            "https://example.com/payroll",
+            "/payroll",
+            "https://example.com/payment-methods-help",
+            "/payment-methods-help",
+        ],
+    )
+    def test_goto_allowed_normal_urls(self, url: str):
+        verdict = check_action("goto", url=url)
+        assert verdict.allowed
+        assert "allowed" in verdict.reason.lower()
+
+    def test_select_option_is_safe_action(self):
+        verdict = check_action("select_option", element="Option 2")
+        assert verdict.allowed
+        assert "select option action allowed" in verdict.reason.lower()
+
+    def test_page_state_hash_with_scroll_buckets(self):
+        h0 = compute_page_state_hash("https://example.com", [], scroll_info="Scroll: 0% of page")
+        h5 = compute_page_state_hash("https://example.com", [], scroll_info="Scroll: 5% of page")
+        h15 = compute_page_state_hash("https://example.com", [], scroll_info="Scroll: 15% of page")
+        h50 = compute_page_state_hash("https://example.com", [], scroll_info="Scroll: 50% of page")
+        # 0% and 5% are in the same 0% bucket
+        assert h0 == h5
+        # 15% is in the 10% bucket, different from 0% bucket
+        assert h0 != h15
+        assert h15 != h50
+
+    def test_goto_as_dict(self):
+        blocked_action = {
+            "tool_name": "goto",
+            "tool_args": {"url": "https://example.com/checkout-complete"},
+        }
+        allowed_action = {
+            "tool_name": "goto",
+            "tool_args": {"url": "https://example.com/cart.html"},
+        }
+        assert not check_action(blocked_action).allowed
+        assert check_action(allowed_action).allowed
 
     def test_action_as_dict(self):
         action_dict = {

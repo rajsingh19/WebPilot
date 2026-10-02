@@ -52,8 +52,11 @@ cp .env.example .env
 Edit `.env` with your credentials and configuration:
 
 ```env
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
-MODEL_NAME=claude-3-5-sonnet-20241022
+PROVIDER=groq
+MODEL_NAME=openai/gpt-oss-120b
+GROQ_API_KEY=your_api_key_here
 ```
+
+Supported providers: `groq`, `gemini`, `anthropic`.
 
 > **Note**: `MODEL_NAME` is fully configurable and should never be hardcoded in application logic.

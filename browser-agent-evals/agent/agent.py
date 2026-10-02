@@ -18,7 +18,21 @@ from agent.guardrails import (
     compute_page_state_hash,
     element_label,
 )
-from agent.llm import LLMError, decide, estimate_cost
+from agent.llm import (
+    LLMConfigError,
+    LLMError,
+    LLMInfraError,
+    decide,
+    estimate_cost,
+    get_model_for_provider,
+    get_provider_priority,
+    is_failover_enabled,
+    is_provider_exhausted,
+    is_rate_limit_error,
+    mark_provider_exhausted,
+    normalize_provider_name,
+    pick_active_provider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +51,14 @@ class RunResult:
     summary: str
     question: Optional[str] = None
     trace_file: Optional[str] = None
+    primary_model: Optional[str] = None
+    model_used: Optional[str] = None
+    fallback_used: bool = False
+    fallback_reason: Optional[str] = None
+    per_provider: Optional[Dict[str, Any]] = None
+    provider_used: Optional[str] = None
+    failover_happened: bool = False
+    failure_category: Optional[str] = None
 
 
 @dataclass
@@ -64,20 +86,31 @@ class Agent:
         self,
         provider: Optional[str] = None,
         model_name: Optional[str] = None,
+        fallback_provider: Optional[str] = None,
+        fallback_model_name: Optional[str] = None,
         browser_session: Optional[BrowserSession] = None,
         headless: bool = True,
         max_steps: int = 12,
         max_wall_time: float = 120.0,
         traces_root: str = "traces",
+        failover_enabled: Optional[bool] = None,
     ) -> None:
-        self.provider = provider or os.getenv("PROVIDER", "anthropic")
-        self.model_name = model_name or os.getenv("MODEL_NAME", "claude-3-5-sonnet-20241022")
+        self.provider = provider
+        self.model_name = model_name
+
+        fb_prov = fallback_provider if fallback_provider is not None else os.getenv("FALLBACK_PROVIDER", "")
+        self.fallback_provider: Optional[str] = fb_prov.strip() if fb_prov else None
+
+        fb_model = fallback_model_name if fallback_model_name is not None else os.getenv("FALLBACK_MODEL_NAME", "")
+        self.fallback_model_name: Optional[str] = fb_model.strip() if fb_model else None
+
         self.browser_session = browser_session
         self.headless = headless
         self.max_steps = max_steps
         self.max_wall_time = max_wall_time
         self.traces_root = Path(traces_root)
         self._owned_session: bool = False
+        self.failover_enabled = failover_enabled if failover_enabled is not None else is_failover_enabled(default=True)
 
     def _get_or_create_session(self) -> BrowserSession:
         """Retrieves the active session or starts an owned session."""
@@ -102,6 +135,7 @@ class Agent:
         goal: str,
         start_url: str,
         confirm_callback: Optional[Callable[[str], bool]] = None,
+        max_steps: Optional[int] = None,
     ) -> RunResult:
         """Executes the agent loop to achieve the given goal starting from start_url.
 
@@ -124,8 +158,99 @@ class Agent:
         hallucinated_ids = 0
         blocked_attempts = 0
 
+        failover_happened = False
+        failure_category: Optional[str] = None
+
+        if self.failover_enabled:
+            chosen_prov, chosen_model = pick_active_provider(
+                preferred_provider=self.provider,
+                preferred_model=self.model_name,
+            )
+            if not chosen_prov:
+                logger.error("All providers in priority list are currently exhausted.")
+                final_status = "error"
+                failure_category = "rate_limited"
+                final_summary = "All providers exhausted due to rate limits."
+                trace_data = {
+                    "run_id": run_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "goal": goal,
+                    "start_url": start_url,
+                    "final_url": start_url,
+                    "provider": self.provider or "none",
+                    "model": self.model_name or "none",
+                    "provider_used": self.provider or "none",
+                    "model_used": self.model_name or "none",
+                    "failover_happened": False,
+                    "status": final_status,
+                    "failure_category": failure_category,
+                    "summary": final_summary,
+                    "duration_s": 0.0,
+                    "total_tokens": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                    "hallucinated_ids_count": 0,
+                    "steps": [],
+                }
+                try:
+                    with open(trace_json_path, "w", encoding="utf-8") as f:
+                        json.dump(trace_data, f, indent=2)
+                except Exception as exc:
+                    logger.error("Failed to write trace file: %s", exc)
+
+                return RunResult(
+                    status=final_status,
+                    steps=0,
+                    total_tokens=0,
+                    estimated_cost_usd=0.0,
+                    duration_s=0.0,
+                    final_url=start_url,
+                    trace_dir=str(run_trace_dir),
+                    summary=final_summary,
+                    trace_file=str(trace_json_path),
+                    primary_model=self.model_name,
+                    model_used=self.model_name or "none",
+                    provider_used=self.provider or "none",
+                    failover_happened=False,
+                    failure_category=failure_category,
+                )
+
+            priority_first = get_provider_priority()[0] if get_provider_priority() else "groq"
+            configured_primary = self.provider or priority_first
+            if normalize_provider_name(chosen_prov) != normalize_provider_name(configured_primary):
+                failover_happened = True
+
+            primary_provider = chosen_prov
+            primary_model = chosen_model
+        else:
+            primary_provider = self.provider or os.getenv("PROVIDER", "groq")
+            primary_model = self.model_name or get_model_for_provider(primary_provider)
+
+        current_provider = primary_provider
+        current_model = primary_model
+        fallback_used = False
+        fallback_reason: Optional[str] = None
+
+        provider_usage: Dict[str, Dict[str, Any]] = {
+            primary_provider: {
+                "model": primary_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+            }
+        }
+        if self.fallback_provider and self.fallback_model_name:
+            provider_usage[self.fallback_provider] = {
+                "model": self.fallback_model_name,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+            }
+
+        effective_max_steps = max_steps if max_steps is not None else self.max_steps
         loop_detector = LoopDetector(tuple_threshold=3, state_threshold=4)
-        step_limiter = StepLimiter(max_steps=self.max_steps, max_wall_time=self.max_wall_time)
+        step_limiter = StepLimiter(max_steps=effective_max_steps, max_wall_time=self.max_wall_time)
 
         final_status = "failed"
         final_summary = "Run terminated without conclusion."
@@ -142,8 +267,7 @@ class Agent:
 
             step_no = 0
             while True:
-                step_no += 1
-                limit_verdict = step_limiter.step()
+                limit_verdict = step_limiter.check()
                 if limit_verdict.exceeded:
                     if "Time limit" in limit_verdict.reason:
                         final_status = "timeout"
@@ -152,6 +276,8 @@ class Agent:
                     final_summary = limit_verdict.reason
                     break
 
+                step_no += 1
+
                 # 1. Observe current page
                 screenshot_filename = f"step_{step_no}.png"
                 screenshot_file_path = run_trace_dir / screenshot_filename
@@ -159,30 +285,137 @@ class Agent:
                 current_url = obs.url or current_url
 
                 # Compute page state hash for loop detection
-                page_state_hash = compute_page_state_hash(obs.url, obs.elements)
+                page_state_hash = compute_page_state_hash(obs.url, obs.elements, obs.scroll_info)
 
                 # Format prompt representation
                 observation_prompt_text = to_prompt_text(obs)
 
                 # 2. LLM Decision
                 llm_start = time.monotonic()
+                decision = None
                 try:
                     decision = decide(
                         goal=goal,
                         history=history_entries,
                         observation_text=observation_prompt_text,
-                        model_name=self.model_name,
-                        provider=self.provider,
+                        model_name=current_model,
+                        provider=current_provider,
                     )
-                except LLMError as exc:
+                except LLMConfigError as exc:
                     final_status = "error"
-                    final_summary = f"LLM error: {exc}"
-                    logger.error("LLM decision error: %s", exc)
+                    final_summary = f"LLM configuration error: {exc}"
+                    logger.error("LLM config error (fallback not attempted): %s", exc)
                     break
+                except (LLMInfraError, LLMError, Exception) as exc:
+                    # Check for 429 / quota / rate limit errors
+                    if is_rate_limit_error(exc):
+                        mark_provider_exhausted(current_provider)
+                        is_step_1 = (step_no == 1 and len(step_records) == 0)
+
+                        if is_step_1 and self.failover_enabled:
+                            next_prov, next_model = pick_active_provider()
+                            if next_prov is not None:
+                                logger.warning(
+                                    "Provider '%s' rate limited at step 1. Restarting run on backup provider '%s' (%s).",
+                                    current_provider,
+                                    next_prov,
+                                    next_model,
+                                )
+                                current_provider = next_prov
+                                current_model = next_model
+                                failover_happened = True
+
+                                # Restart run on the next provider
+                                step_no = 0
+                                step_limiter.reset()
+                                loop_detector = LoopDetector(tuple_threshold=3, state_threshold=4)
+                                step_records.clear()
+                                history_entries.clear()
+                                if start_url:
+                                    session.goto(start_url)
+                                continue
+
+                        # Mid-run rate limit or no backup provider available
+                        final_status = "error"
+                        failure_category = "rate_limited"
+                        final_summary = f"Provider '{current_provider}' rate limited: {exc}"
+                        logger.error(
+                            "Provider '%s' rate limited (step %d, failover=%s): %s",
+                            current_provider,
+                            step_no,
+                            self.failover_enabled,
+                            exc,
+                        )
+                        break
+
+                    can_fallback = (
+                        not fallback_used
+                        and bool(self.fallback_provider)
+                        and bool(self.fallback_model_name)
+                    )
+                    if can_fallback:
+                        logger.warning(
+                            "Primary provider '%s' failed with '%s'. Switching to fallback provider '%s' (%s).",
+                            current_provider,
+                            exc,
+                            self.fallback_provider,
+                            self.fallback_model_name,
+                        )
+                        fallback_used = True
+                        fallback_reason = str(exc)
+                        current_provider = self.fallback_provider
+                        current_model = self.fallback_model_name
+
+                        try:
+                            decision = decide(
+                                goal=goal,
+                                history=history_entries,
+                                observation_text=observation_prompt_text,
+                                model_name=current_model,
+                                provider=current_provider,
+                            )
+                        except LLMConfigError as fb_exc:
+                            final_status = "error"
+                            final_summary = f"Fallback configuration error: {fb_exc}"
+                            logger.error("Fallback provider config error: %s", fb_exc)
+                            break
+                        except (LLMInfraError, LLMError, Exception) as fb_exc:
+                            final_status = "infra_error"
+                            final_summary = (
+                                f"Both primary and fallback providers failed. Primary: {fallback_reason}. Fallback: {fb_exc}"
+                            )
+                            logger.error("Both providers failed: %s", final_summary)
+                            break
+                    else:
+                        if fallback_used:
+                            final_status = "infra_error"
+                            final_summary = f"Fallback provider failed: {exc}"
+                        elif isinstance(exc, LLMInfraError) and (bool(self.fallback_provider)):
+                            final_status = "infra_error"
+                            final_summary = f"Infrastructure error: {exc}"
+                        else:
+                            final_status = "error"
+                            final_summary = f"LLM error: {exc}"
+                        logger.error("LLM decision error: %s", exc)
+                        break
 
                 llm_latency_ms = int((time.monotonic() - llm_start) * 1000)
                 total_input_tokens += decision.input_tokens
                 total_output_tokens += decision.output_tokens
+
+                if current_provider not in provider_usage:
+                    provider_usage[current_provider] = {
+                        "model": current_model,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": 0.0,
+                    }
+                provider_usage[current_provider]["input_tokens"] += decision.input_tokens
+                provider_usage[current_provider]["output_tokens"] += decision.output_tokens
+                step_cost = estimate_cost(current_model, decision.input_tokens, decision.output_tokens)
+                provider_usage[current_provider]["cost_usd"] = round(
+                    provider_usage[current_provider]["cost_usd"] + step_cost, 6
+                )
 
                 action_name = decision.tool_name
                 action_args = decision.tool_args
@@ -281,6 +514,7 @@ class Agent:
                                     latency_ms=llm_latency_ms,
                                 )
                             )
+                            step_limiter.step()
                             continue
 
                 # 5. Check for hallucinated element ID
@@ -315,16 +549,18 @@ class Agent:
                                     latency_ms=llm_latency_ms,
                                 )
                             )
+                            step_limiter.step()
                             continue
                         target_element = matched[0]
 
                 # 6. Safety Guardrail Check
                 target_label = element_label(target_element) if target_element else ""
                 press_enter_flag = bool(action_args.get("press_enter", False))
+                dest_url = str(action_args.get("url", "")) if action_name == "goto" else obs.url
                 guard_verdict = check_action(
                     action=action_name,
                     element=target_label,
-                    url=obs.url,
+                    url=dest_url or obs.url,
                     press_enter=press_enter_flag,
                 )
 
@@ -363,6 +599,7 @@ class Agent:
                             f"Execution stopped: action blocked 2 times by guardrails ({guard_verdict.reason})."
                         )
                         break
+                    step_limiter.step()
                     continue
 
                 # 7. Check Loop Detection with page_state_hash
@@ -405,6 +642,12 @@ class Agent:
                         press_enter=bool(action_args.get("press_enter", False)),
                     )
                     action_result_str = res.message
+                elif action_name == "select_option":
+                    res = session.select_option(
+                        id=int(action_args["id"]),
+                        value_or_label=str(action_args.get("value_or_label", "")),
+                    )
+                    action_result_str = res.message
                 elif action_name == "goto":
                     res = session.goto(url=str(action_args["url"]))
                     action_result_str = res.message
@@ -443,6 +686,7 @@ class Agent:
                         latency_ms=llm_latency_ms,
                     )
                 )
+                step_limiter.step()
 
         except Exception as exc:
             logger.exception("Unexpected exception in Agent.run(): %s", exc)
@@ -451,16 +695,24 @@ class Agent:
 
         duration_s = round(time.monotonic() - start_time, 2)
         total_tokens = total_input_tokens + total_output_tokens
-        cost_usd = estimate_cost(self.model_name, total_input_tokens, total_output_tokens)
+        cost_usd = round(sum(p["cost_usd"] for p in provider_usage.values()), 6)
 
         # Write trace.json
         trace_data = {
             "run_id": run_id,
             "goal": goal,
             "start_url": start_url,
-            "provider": self.provider,
-            "model": self.model_name,
+            "provider": current_provider,
+            "model": current_model,
+            "provider_used": current_provider,
+            "model_used": current_model,
+            "failover_happened": failover_happened,
+            "primary_model": primary_model,
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
+            "per_provider": provider_usage,
             "status": final_status,
+            "failure_category": failure_category,
             "summary": final_summary,
             "question": asked_question,
             "total_steps": len(step_records),
@@ -490,6 +742,14 @@ class Agent:
             summary=final_summary,
             question=asked_question,
             trace_file=str(trace_json_path),
+            primary_model=primary_model,
+            model_used=current_model,
+            provider_used=current_provider,
+            failover_happened=failover_happened,
+            failure_category=failure_category,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            per_provider=provider_usage,
         )
 
 
@@ -503,8 +763,10 @@ if __name__ == "__main__":
     parser.add_argument("--goal", type=str, required=True, help="Goal for the browser agent")
     parser.add_argument("--url", type=str, required=True, help="Starting URL")
     parser.add_argument("--headed", action="store_true", help="Launch browser in headed mode")
-    parser.add_argument("--provider", type=str, default=None, help="LLM Provider (anthropic, gemini, grok)")
+    parser.add_argument("--provider", type=str, default=None, help="LLM Provider (anthropic, gemini, groq)")
     parser.add_argument("--model", type=str, default=None, help="Model name")
+    parser.add_argument("--fallback-provider", type=str, default=None, help="Fallback LLM Provider (anthropic, gemini, groq)")
+    parser.add_argument("--fallback-model", type=str, default=None, help="Fallback model name")
     parser.add_argument("--max-steps", type=int, default=12, help="Maximum execution steps")
 
     args = parser.parse_args()
@@ -523,6 +785,8 @@ if __name__ == "__main__":
     agent = Agent(
         provider=args.provider,
         model_name=args.model,
+        fallback_provider=args.fallback_provider,
+        fallback_model_name=args.fallback_model,
         headless=not args.headed,
         max_steps=args.max_steps,
     )
@@ -535,6 +799,11 @@ if __name__ == "__main__":
         table.add_column("Value")
 
         table.add_row("Status", f"[{'green' if result.status == 'success' else 'red'}]{result.status}[/]")
+        table.add_row("Primary Model", str(result.primary_model or "-"))
+        table.add_row("Model Used", str(result.model_used or "-"))
+        table.add_row("Fallback Used", str(result.fallback_used))
+        if result.fallback_reason:
+            table.add_row("Fallback Reason", str(result.fallback_reason))
         table.add_row("Steps Executed", str(result.steps))
         table.add_row("Duration", f"{result.duration_s}s")
         table.add_row("Total Tokens", str(result.total_tokens))

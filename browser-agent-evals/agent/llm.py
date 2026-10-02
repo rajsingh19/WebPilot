@@ -3,14 +3,24 @@
 from dataclasses import dataclass
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
 from agent.providers.anthropic_provider import AnthropicProvider
-from agent.providers.base import Decision, LLMError, LLMProvider
+from agent.providers.base import (
+    Decision,
+    LLMConfigError,
+    LLMError,
+    LLMInfraError,
+    LLMProvider,
+)
 from agent.providers.gemini_provider import GeminiProvider
-from agent.providers.grok_provider import GrokProvider
+from agent.providers.groq_provider import GroqProvider
+
+# Backward compatibility alias
+GrokProvider = GroqProvider
 
 load_dotenv()
 
@@ -19,18 +29,20 @@ logger = logging.getLogger(__name__)
 # Editable pricing dictionary per million tokens in USD
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # Anthropic
-    "claude-3-5-sonnet-20241022": {"input": 3.0, "output": 15.0},
+    "claude-sonnet-5-5": {"input": 3.0, "output": 15.0},  # verify on Anthropic pricing page
     "claude-3-5-sonnet-latest": {"input": 3.0, "output": 15.0},
     "claude-3-5-haiku-20241022": {"input": 0.8, "output": 4.0},
     "claude-3-5-haiku-latest": {"input": 0.8, "output": 4.0},
     "claude-3-opus-20240229": {"input": 15.0, "output": 75.0},
     "claude-3-opus-latest": {"input": 15.0, "output": 75.0},
     # Gemini
+    "gemini-3.8-flash": {"input": 0.10, "output": 0.40},  # verify on pricing page
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
     "gemini-2.0-flash-exp": {"input": 0.10, "output": 0.40},
     "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
     "gemini-1.5-pro": {"input": 1.25, "output": 5.0},
-    # Grok
+    # Groq
+    "openai/gpt-oss-120b": {"input": 0.15, "output": 0.60},  # verify on pricing page
     "grok-beta": {"input": 5.0, "output": 15.0},
     "grok-2-1212": {"input": 2.0, "output": 10.0},
     "grok-2-vision-1212": {"input": 2.0, "output": 10.0},
@@ -45,7 +57,12 @@ SYSTEM_PROMPT = """You control a web browser to achieve the user's goal. Follow 
 4. NEVER perform irreversible actions (place order, pay, send, delete, submit final form) yourself.
    Instead call ask_user with exactly what will happen (recipient, text, amount, item).
 5. If the same action fails twice, try a different approach. If stuck, call finish(success=false) with the reason.
-6. Call finish(success=true) only when the goal is truly complete and visible on screen."""
+6. Call finish(success=true) only when the goal is truly complete and visible on screen.
+7. The observation includes Page text; read error messages from there.
+8. Use select_option for dropdowns, never click.
+9. All interactive elements are already listed. Do not scroll unless an expected element is missing. For the cart, use the link labelled cart; for checkout, use the checkout button.
+10. Use ask_user ONLY before an irreversible action (placing an order, payment, sending). Never ask the user for credentials or details already given in the goal.
+11. If the goal is to report something (e.g. an error message), call finish(success=true) with that exact text in summary."""
 
 # Canonical tool definition list (JSON schema) with required "reasoning" on every tool
 TOOLS: List[Dict[str, Any]] = [
@@ -91,6 +108,28 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["id", "text", "reasoning"],
+        },
+    },
+    {
+        "name": "select_option",
+        "description": "Select an option from a dropdown element by value or label.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation of why this action is taken.",
+                },
+                "id": {
+                    "type": "integer",
+                    "description": "The sequential element ID of the select element.",
+                },
+                "value_or_label": {
+                    "type": "string",
+                    "description": "The value or visible label of the option to select.",
+                },
+            },
+            "required": ["id", "value_or_label", "reasoning"],
         },
     },
     {
@@ -265,8 +304,8 @@ def get_provider(
             client=client,
             max_retries=max_retries,
         )
-    elif normalized in ("grok", "xai"):
-        return GrokProvider(
+    elif normalized in ("groq", "grok", "xai"):
+        return GroqProvider(
             model_name=model_name,
             api_key=api_key,
             client=client,
@@ -274,7 +313,7 @@ def get_provider(
         )
     else:
         raise LLMError(
-            f"Unsupported provider '{provider_name}'. Supported providers: 'anthropic', 'gemini', 'grok'."
+            f"Unsupported provider '{provider_name}'. Supported providers: 'anthropic', 'gemini', 'groq'."
         )
 
 
@@ -295,7 +334,7 @@ def decide(
         or "anthropic"
     ).strip().lower()
 
-    resolved_model = model_name or os.getenv("MODEL_NAME")
+    resolved_model = model_name or os.getenv("MODEL_NAME", "claude-sonnet-5-5")
     if not resolved_model:
         raise LLMError(
             "MODEL_NAME is not set. Please specify MODEL_NAME in environment (.env) or pass it to decide()."
@@ -327,12 +366,164 @@ Current Page Observation:
     )
 
 
+
+# Provider exhaustion tracking (in-memory)
+EXHAUSTED_PROVIDERS: Dict[str, float] = {}  # normalized provider name -> expiry timestamp
+
+
+def normalize_provider_name(provider_name: str) -> str:
+    """Normalizes provider aliases to canonical names ('groq', 'gemini', 'anthropic')."""
+    p = (provider_name or "").strip().lower()
+    if p in ("groq", "grok", "xai"):
+        return "groq"
+    if p in ("gemini", "google"):
+        return "gemini"
+    if p in ("anthropic", "claude"):
+        return "anthropic"
+    return p
+
+
+def get_model_for_provider(provider_name: str, fallback_model: Optional[str] = None) -> str:
+    """Returns the configured model for a provider from environment or defaults."""
+    norm = normalize_provider_name(provider_name)
+    if norm == "groq":
+        return (
+            os.getenv("MODEL_NAME_GROK")
+            or os.getenv("MODEL_NAME_GROQ")
+            or fallback_model
+            or os.getenv("MODEL_NAME")
+            or "openai/gpt-oss-120b"
+        )
+    elif norm == "gemini":
+        return (
+            os.getenv("MODEL_NAME_GEMINI")
+            or os.getenv("MODEL_NAME_GOOGLE")
+            or fallback_model
+            or os.getenv("MODEL_NAME")
+            or "gemini-2.0-flash"
+        )
+    elif norm == "anthropic":
+        return (
+            os.getenv("MODEL_NAME_ANTHROPIC")
+            or fallback_model
+            or os.getenv("MODEL_NAME")
+            or "claude-sonnet-5-5"
+        )
+    return fallback_model or os.getenv("MODEL_NAME") or "default"
+
+
+def is_provider_exhausted(provider_name: str) -> bool:
+    """Returns True if provider is currently in exhaustion cooldown, False otherwise."""
+    norm = normalize_provider_name(provider_name)
+    expiry = EXHAUSTED_PROVIDERS.get(norm)
+    if expiry is None:
+        return False
+    if time.time() >= expiry:
+        EXHAUSTED_PROVIDERS.pop(norm, None)
+        return False
+    return True
+
+
+def mark_provider_exhausted(provider_name: str, cooldown_seconds: Optional[float] = None) -> float:
+    """Marks a provider as exhausted for cooldown_seconds (default 10 min = 600s)."""
+    norm = normalize_provider_name(provider_name)
+    if cooldown_seconds is None:
+        cooldown_seconds = float(os.getenv("PROVIDER_COOLDOWN_SECONDS", "600"))
+    expiry = time.time() + cooldown_seconds
+    EXHAUSTED_PROVIDERS[norm] = expiry
+    logger.warning("Provider '%s' marked exhausted for %.1fs (cooldown until %s).", norm, cooldown_seconds, expiry)
+    return expiry
+
+
+def reset_provider_exhaustion(provider_name: Optional[str] = None) -> None:
+    """Resets exhaustion state for a specific provider or all providers."""
+    if provider_name:
+        norm = normalize_provider_name(provider_name)
+        EXHAUSTED_PROVIDERS.pop(norm, None)
+    else:
+        EXHAUSTED_PROVIDERS.clear()
+
+
+def get_provider_priority() -> List[str]:
+    """Returns ordered list of canonical provider names from PROVIDER_PRIORITY."""
+    raw = os.getenv("PROVIDER_PRIORITY", "grok,gemini")
+    return [normalize_provider_name(p.strip()) for p in raw.split(",") if p.strip()]
+
+
+def is_failover_enabled(default: bool = True) -> bool:
+    """Checks if FAILOVER_ENABLED is set in environment."""
+    raw = os.getenv("FAILOVER_ENABLED")
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def pick_active_provider(
+    priority: Optional[List[str]] = None,
+    preferred_provider: Optional[str] = None,
+    preferred_model: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Selects the first non-exhausted provider in priority order.
+
+    Returns (provider, model_name) or (None, None) if all are exhausted.
+    """
+    priority_list = priority if priority is not None else get_provider_priority()
+    if preferred_provider:
+        norm_pref = normalize_provider_name(preferred_provider)
+        if not is_provider_exhausted(norm_pref):
+            model = preferred_model or get_model_for_provider(norm_pref)
+            return norm_pref, model
+
+    for prov in priority_list:
+        norm_prov = normalize_provider_name(prov)
+        if not is_provider_exhausted(norm_prov):
+            model = get_model_for_provider(norm_prov)
+            return norm_prov, model
+
+    return None, None
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    """Determines whether an exception corresponds to a 429, quota, or rate limit error."""
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if code in (429, "429", "rate_limit_exceeded"):
+        return True
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        if body.get("code") in ("rate_limit_exceeded", "resource_exhausted") or body.get("type") == "tokens":
+            return True
+        err = body.get("error")
+        if isinstance(err, dict):
+            if err.get("code") in ("rate_limit_exceeded", "resource_exhausted") or err.get("type") == "tokens":
+                return True
+
+    msg = str(exc).lower()
+    return any(phrase in msg for phrase in (
+        "429",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "tokens per day",
+        "tokens per minute",
+        "requests per minute",
+        "tpd",
+        "rpm",
+        "tpm",
+        "resource_exhausted",
+        "exceeded your current quota",
+    ))
+
+
 __all__ = [
     "Decision",
     "LLMError",
+    "LLMConfigError",
+    "LLMInfraError",
     "LLMProvider",
     "AnthropicProvider",
     "GeminiProvider",
+    "GroqProvider",
     "GrokProvider",
     "MODEL_PRICING",
     "SYSTEM_PROMPT",
@@ -341,4 +532,13 @@ __all__ = [
     "format_history",
     "get_provider",
     "decide",
+    "normalize_provider_name",
+    "get_model_for_provider",
+    "is_provider_exhausted",
+    "mark_provider_exhausted",
+    "reset_provider_exhaustion",
+    "get_provider_priority",
+    "is_failover_enabled",
+    "pick_active_provider",
+    "is_rate_limit_error",
 ]

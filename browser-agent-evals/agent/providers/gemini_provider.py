@@ -2,6 +2,7 @@
 
 import logging
 import os
+import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -9,7 +10,13 @@ from google import genai
 from google.genai import errors, types
 import httpx
 
-from agent.providers.base import Decision, LLMError, LLMProvider
+from agent.providers.base import (
+    Decision,
+    LLMConfigError,
+    LLMError,
+    LLMInfraError,
+    LLMProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +59,19 @@ class GeminiProvider(LLMProvider):
             )
         return [types.Tool(function_declarations=declarations)]
 
+    def _get_status_code(self, exc: Exception) -> Optional[int]:
+        """Extracts numeric HTTP status code from exception if available."""
+        if hasattr(exc, "code") and isinstance(exc.code, int):
+            return exc.code
+        if hasattr(exc, "status_code") and isinstance(exc.status_code, int):
+            return exc.status_code
+        return None
+
     def _is_retryable_error(self, exc: Exception) -> bool:
         """Determines if the exception is due to rate limits, connection issues, or 5xx server errors."""
-        if isinstance(exc, errors.APIError):
-            code = getattr(exc, "code", None)
-            if code == 429 or (code is not None and code >= 500):
-                return True
-            return False
+        code = self._get_status_code(exc)
+        if code in (429, 500, 502, 503, 504):
+            return True
         if isinstance(exc, (httpx.RequestError, ConnectionError, TimeoutError)):
             return True
         return False
@@ -142,27 +155,42 @@ class GeminiProvider(LLMProvider):
                     output_tokens=output_tokens,
                 )
 
+            except (LLMConfigError, LLMInfraError):
+                raise
             except LLMError:
                 raise
             except Exception as exc:
+                code = self._get_status_code(exc)
+                if code in (400, 401, 403):
+                    logger.error("Non-retryable configuration error (%s): %s", code, exc)
+                    raise LLMConfigError(f"Gemini configuration error ({code}): {exc}") from exc
+
                 if self._is_retryable_error(exc):
                     last_exception = exc
+                    jitter = random.uniform(0.1, 0.5 * backoff)
+                    sleep_time = backoff + jitter
                     logger.warning(
-                        "Gemini retryable error on attempt %d/%d: %s. Retrying in %.1fs...",
+                        "Gemini retryable error on attempt %d/%d (code=%s): %s. Retrying in %.2fs...",
                         attempt,
                         self.max_retries,
+                        code or "network",
                         exc,
-                        backoff,
+                        sleep_time,
                     )
                     if attempt < self.max_retries:
-                        time.sleep(backoff)
+                        time.sleep(sleep_time)
                         backoff *= 2.0
                     else:
-                        raise LLMError(
-                            f"Gemini API failed after {self.max_retries} retries: {exc}"
+                        raise LLMInfraError(
+                            f"Gemini API failed after {self.max_retries} retries: {exc}",
+                            status_code=code,
+                            is_retryable=True,
                         ) from exc
+                elif code == 404:
+                    logger.warning("Gemini model not found (404): %s", exc)
+                    raise LLMInfraError(f"Gemini model not found (404): {exc}", status_code=404) from exc
                 else:
                     logger.error("Non-retryable Gemini API error: %s", exc)
                     raise LLMError(f"Gemini API non-retryable error: {exc}") from exc
 
-        raise LLMError(f"Gemini provider failed: {last_exception}")
+        raise LLMInfraError(f"Gemini provider failed: {last_exception}")

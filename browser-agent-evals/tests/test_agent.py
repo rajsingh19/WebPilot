@@ -211,8 +211,33 @@ class TestAgentExecution:
         )
         result = agent.run(goal="Test error", start_url="https://example.com")
 
-        assert result.status == "error"
+        assert result.status in ("error", "infra_error")
         assert "API rate limit exhausted" in result.summary
+
+    @patch("agent.agent.decide")
+    def test_run_fallback_success(self, mock_decide, mock_browser_session, tmp_path):
+        # First call (primary) raises LLMError, second call (fallback) succeeds
+        mock_decide.side_effect = [
+            LLMError("Primary 503 unavailable"),
+            Decision(
+                tool_name="finish",
+                tool_args={"success": True, "summary": "Done via fallback."},
+                reasoning="",
+                input_tokens=10,
+                output_tokens=5,
+            ),
+        ]
+        agent = Agent(
+            browser_session=mock_browser_session,
+            traces_root=str(tmp_path),
+            fallback_provider="groq",
+            fallback_model_name="openai/gpt-oss-120b",
+        )
+        result = agent.run(goal="Test fallback", start_url="https://example.com")
+        assert result.status == "success"
+        assert result.fallback_used is True
+        assert result.model_used == "openai/gpt-oss-120b"
+        assert "Primary 503" in result.fallback_reason
 
     def test_browser_session_kept_open_after_run(self, mock_browser_session, tmp_path):
         with patch("agent.agent.decide") as mock_decide:
@@ -231,3 +256,77 @@ class TestAgentExecution:
 
             # BrowserSession.close() must NOT have been called automatically
             mock_browser_session.close.assert_not_called()
+
+    @patch("agent.agent.decide")
+    def test_run_per_test_max_steps_overrides_default_12(
+        self, mock_decide, mock_browser_session, tmp_path
+    ):
+        mock_browser_session.observe.side_effect = [
+            Observation(
+                url=f"https://example.com/page_{i}",
+                title=f"Page {i}",
+                elements=[InteractiveElement(id=i, tag="div", text=f"Item {i}")],
+                screenshot_path=None,
+            )
+            for i in range(10)
+        ]
+        mock_decide.side_effect = [
+            Decision(
+                tool_name="scroll",
+                tool_args={"direction": "down"},
+                reasoning=f"Step {i}",
+                input_tokens=10,
+                output_tokens=5,
+            )
+            for i in range(10)
+        ]
+        agent = Agent(
+            browser_session=mock_browser_session,
+            traces_root=str(tmp_path),
+            max_steps=12,
+        )
+        assert agent.max_steps == 12
+
+        # Override default 12 with max_steps=5
+        result = agent.run(goal="Scroll test", start_url="https://example.com", max_steps=5)
+        assert result.status == "failed"
+        assert result.steps == 5
+        assert "5/5 steps executed" in result.summary
+
+    @patch("agent.agent.decide")
+    def test_blocked_action_not_executed_and_reports_status_blocked(
+        self, mock_decide, mock_browser_session, tmp_path
+    ):
+        # Two consecutive attempts to navigate to blocked URL
+        mock_decide.side_effect = [
+            Decision(
+                tool_name="goto",
+                tool_args={"url": "https://example.com/checkout-complete"},
+                reasoning="Attempt direct jump to complete.",
+                input_tokens=40,
+                output_tokens=10,
+            ),
+            Decision(
+                tool_name="goto",
+                tool_args={"url": "https://example.com/checkout-complete"},
+                reasoning="Retry direct jump to complete.",
+                input_tokens=40,
+                output_tokens=10,
+            ),
+        ]
+        agent = Agent(
+            browser_session=mock_browser_session,
+            traces_root=str(tmp_path),
+        )
+        result = agent.run(goal="Finish order", start_url="https://example.com")
+
+        # 1. Action is reported with status 'blocked'
+        assert result.status == "blocked"
+        # 2. Confirmed not auto-converted to needs_confirmation
+        assert result.status != "needs_confirmation"
+        assert "blocked 2 times" in result.summary
+
+        # 3. Destination URL is NOT executed on the browser
+        for call_args in mock_browser_session.goto.call_args_list:
+            called_url = call_args[0][0] if call_args[0] else call_args[1].get("url", "")
+            assert "checkout-complete" not in called_url

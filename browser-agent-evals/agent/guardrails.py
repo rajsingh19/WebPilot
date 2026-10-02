@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,62 @@ RISKY_PATTERNS: List[str] = [
 COMPILED_RISKY_PATTERNS: List[re.Pattern] = [
     re.compile(pattern, re.IGNORECASE) for pattern in RISKY_PATTERNS
 ]
+
+GOTO_BLOCKED_PATH_PATTERNS: List[str] = [
+    "checkout-complete",
+    "order-complete",
+    "/pay",
+    "/payment",
+    "/confirm",
+]
+
+
+def is_goto_url_blocked(target_url: str) -> Optional[str]:
+    """Checks whether a goto destination URL path matches any blocked patterns.
+
+    Blocked patterns:
+        - checkout-complete (anywhere in path)
+        - order-complete (anywhere in path)
+        - /pay (as path segment only: /pay, /pay/, /checkout/pay, but NOT /payroll or /payment-methods-help)
+        - /payment (blocked explicitly as a segment or html path)
+        - /confirm (blocked as segment or html path)
+
+    Allowed examples:
+        - /cart.html
+        - /inventory.html
+        - /payroll
+        - /payment-methods-help
+    """
+    clean = (target_url or "").strip().lower()
+    if not clean:
+        return None
+
+    parsed = urlparse(clean)
+    path = parsed.path
+    if not path:
+        path = clean
+
+    normalized_path = path if path.startswith("/") else f"/{path}"
+
+    if "checkout-complete" in normalized_path or "checkout-complete" in clean:
+        return "checkout-complete"
+    if "order-complete" in normalized_path or "order-complete" in clean:
+        return "order-complete"
+
+    # /pay must match as a path segment only (e.g. /pay, /pay/, /foo/pay, /foo/pay/)
+    # Must NOT match /payroll or /payment-methods-help
+    if re.search(r"(?:^|/)pay(?:/|$)", normalized_path):
+        return "/pay"
+
+    # /payment must be blocked explicitly
+    if re.search(r"(?:^|/)payment(?:/|\.html|$)", normalized_path):
+        return "/payment"
+
+    # /confirm must be blocked
+    if re.search(r"(?:^|/)confirm(?:/|\.html|$)", normalized_path) or "/confirm" in normalized_path:
+        return "/confirm"
+
+    return None
 
 
 @dataclass
@@ -100,14 +157,26 @@ def element_label(element: Any) -> str:
     return ""
 
 
-def compute_page_state_hash(url: str, elements: Any = None) -> str:
+def compute_page_state_hash(
+    url: str,
+    elements: Any = None,
+    scroll_info: Optional[str] = None,
+) -> str:
     """Computes a stable hash representing current page state.
 
-    Includes URL, element IDs, visible labels, truncated current values (up to 40 chars),
-    checked states, and disabled flags.
+    Includes URL, scroll bucket (if present), element IDs, visible labels,
+    truncated current values (up to 40 chars), checked states, and disabled flags.
     """
     clean_url = (url or "").strip()
     parts = [clean_url]
+    if scroll_info:
+        match = re.search(r"(\d+)%", str(scroll_info))
+        if match:
+            pct = int(match.group(1))
+            bucket = (pct // 10) * 10
+            parts.append(f"scroll_bucket:{bucket}%")
+        else:
+            parts.append(str(scroll_info).strip())
     if elements:
         for el in elements:
             if isinstance(el, dict):
@@ -157,6 +226,7 @@ def check_action(
     """
     action_name = ""
     is_press_enter = False
+    dest_url = (url or "").strip()
 
     if isinstance(action, dict):
         action_name = str(action.get("tool_name") or action.get("name") or action.get("action") or "").lower()
@@ -165,6 +235,8 @@ def check_action(
             is_press_enter = press_enter
         elif isinstance(args, dict):
             is_press_enter = bool(args.get("press_enter", False))
+        if not dest_url and isinstance(args, dict):
+            dest_url = str(args.get("url") or "").strip()
     elif hasattr(action, "tool_name"):
         action_name = str(getattr(action, "tool_name", "")).lower()
         args = getattr(action, "tool_args", {})
@@ -172,6 +244,8 @@ def check_action(
             is_press_enter = press_enter
         elif isinstance(args, dict):
             is_press_enter = bool(args.get("press_enter", False))
+        if not dest_url and isinstance(args, dict):
+            dest_url = str(args.get("url") or "").strip()
     elif isinstance(action, str):
         action_name = action.strip().lower()
         if action_name in ("type_with_enter", "type_and_enter"):
@@ -183,15 +257,33 @@ def check_action(
         action_name = str(action).lower()
         is_press_enter = bool(press_enter)
 
-    # Only evaluate click or type-with-enter actions
+    if action_name == "select_option":
+        return GuardrailVerdict(allowed=True, reason="Select option action allowed.")
+
+    # Evaluate click, type-with-enter, or goto actions
     is_click = action_name == "click"
     is_type_enter = action_name in ("type_text", "type") and is_press_enter
+    is_goto = action_name == "goto"
 
-    if not (is_click or is_type_enter):
+    if not (is_click or is_type_enter or is_goto):
         return GuardrailVerdict(
             allowed=True,
-            reason=f"Action '{action_name}' is not a click or type-with-enter action.",
+            reason=f"Action '{action_name}' is not a click or type-with-enter or goto action.",
         )
+
+    if is_goto:
+        blocked_pattern = is_goto_url_blocked(dest_url)
+        if blocked_pattern:
+            logger.warning(
+                "Guardrail triggered on goto URL path: pattern '%s' matched '%s'",
+                blocked_pattern,
+                dest_url,
+            )
+            return GuardrailVerdict(
+                allowed=False,
+                reason=f"Blocked risky goto navigation: URL path matches '{blocked_pattern}'.",
+            )
+        return GuardrailVerdict(allowed=True, reason="Goto action allowed.")
 
     target_element = element if element is not None else element_text
     clean_label = element_label(target_element)
@@ -342,8 +434,8 @@ class StepLimiter:
         if self.steps_taken >= self.max_steps:
             return LimitVerdict(
                 exceeded=True,
-                reason=f"Step limit reached: {self.steps_taken}/{self.max_steps} steps executed.",
-                steps=self.steps_taken,
+                reason=f"Step limit reached: {self.max_steps}/{self.max_steps} steps executed.",
+                steps=self.max_steps,
                 elapsed_seconds=round(elapsed, 2),
             )
 
