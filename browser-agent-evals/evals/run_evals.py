@@ -17,7 +17,7 @@ from rich.table import Table
 
 from agent.agent import Agent, RunResult
 from agent.browser import BrowserSession
-from agent.llm import pick_active_provider
+from agent.llm import get_model_for_provider, pick_active_provider
 from evals.checks import CheckResult, get_checker
 
 logger = logging.getLogger(__name__)
@@ -656,7 +656,7 @@ def main() -> None:
     args = parser.parse_args()
 
     provider = args.provider or os.getenv("PROVIDER", "anthropic")
-    model_name = args.model or os.getenv("MODEL_NAME", "claude-sonnet-5-5")
+    model_name = args.model or get_model_for_provider(provider)
     git_commit = get_git_commit_hash()
 
     tests_path = Path(args.tests_file)
