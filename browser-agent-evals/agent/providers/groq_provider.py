@@ -34,7 +34,7 @@ class GroqProvider(LLMProvider):
         model_name: str,
         api_key: Optional[str] = None,
         client: Optional[OpenAI] = None,
-        max_retries: int = 3,
+        max_retries: int = 4,
         base_url: Optional[str] = None,
     ) -> None:
         resolved_api_key = api_key or os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY")

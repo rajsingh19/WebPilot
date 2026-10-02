@@ -2,6 +2,7 @@
 
 import logging
 import os
+import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -25,7 +26,7 @@ class AnthropicProvider(LLMProvider):
         model_name: str,
         api_key: Optional[str] = None,
         client: Optional[Anthropic] = None,
-        max_retries: int = 3,
+        max_retries: int = 4,
     ) -> None:
         super().__init__(
             model_name=model_name,
@@ -127,15 +128,17 @@ class AnthropicProvider(LLMProvider):
             except Exception as exc:
                 if self._is_retryable_error(exc):
                     last_exception = exc
+                    jitter = random.uniform(0.1, 0.5 * backoff)
+                    sleep_time = backoff + jitter
                     logger.warning(
-                        "Anthropic retryable error on attempt %d/%d: %s. Retrying in %.1fs...",
+                        "Anthropic retryable error on attempt %d/%d: %s. Retrying in %.2fs...",
                         attempt,
                         self.max_retries,
                         exc,
-                        backoff,
+                        sleep_time,
                     )
                     if attempt < self.max_retries:
-                        time.sleep(backoff)
+                        time.sleep(sleep_time)
                         backoff *= 2.0
                     else:
                         raise LLMError(

@@ -46,10 +46,13 @@ def compute_group_metrics(group_results: List[Dict[str, Any]]) -> Dict[str, Any]
     total = len(group_results)
     infra = sum(1 for r in group_results if r.get("actual_status") == "infra_error")
     rate_limited = sum(1 for r in group_results if r.get("failure_category") == "rate_limited")
-    eval_total = total - infra - rate_limited
+    provider_unavailable = sum(1 for r in group_results if r.get("failure_category") == "provider_unavailable")
+    eval_total = total - infra - rate_limited - provider_unavailable
     passed = sum(
         1 for r in group_results
-        if r.get("passed") and r.get("actual_status") != "infra_error" and r.get("failure_category") != "rate_limited"
+        if r.get("passed")
+        and r.get("actual_status") != "infra_error"
+        and r.get("failure_category") not in ("rate_limited", "provider_unavailable")
     )
     overall_pct = (passed / eval_total * 100.0) if eval_total > 0 else 0.0
 
@@ -59,10 +62,13 @@ def compute_group_metrics(group_results: List[Dict[str, Any]]) -> Dict[str, Any]
         cat_items = [r for r in group_results if r.get("category") == cat]
         c_infra = sum(1 for r in cat_items if r.get("actual_status") == "infra_error")
         c_rl = sum(1 for r in cat_items if r.get("failure_category") == "rate_limited")
-        c_eval = len(cat_items) - c_infra - c_rl
+        c_un = sum(1 for r in cat_items if r.get("failure_category") == "provider_unavailable")
+        c_eval = len(cat_items) - c_infra - c_rl - c_un
         c_passed = sum(
             1 for r in cat_items
-            if r.get("passed") and r.get("actual_status") != "infra_error" and r.get("failure_category") != "rate_limited"
+            if r.get("passed")
+            and r.get("actual_status") != "infra_error"
+            and r.get("failure_category") not in ("rate_limited", "provider_unavailable")
         )
         c_rate = (c_passed / c_eval * 100.0) if c_eval > 0 else 0.0
         by_category[cat] = {
@@ -81,6 +87,7 @@ def compute_group_metrics(group_results: List[Dict[str, Any]]) -> Dict[str, Any]
         "eval_total": eval_total,
         "infra_errors_count": infra,
         "rate_limited_count": rate_limited,
+        "provider_unavailable_count": provider_unavailable,
         "passed_runs": passed,
         "overall_pass_rate_pct": round(overall_pct, 1),
         "by_category": by_category,

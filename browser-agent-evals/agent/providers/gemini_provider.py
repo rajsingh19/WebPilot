@@ -29,7 +29,7 @@ class GeminiProvider(LLMProvider):
         model_name: str,
         api_key: Optional[str] = None,
         client: Optional[genai.Client] = None,
-        max_retries: int = 3,
+        max_retries: int = 4,
     ) -> None:
         super().__init__(
             model_name=model_name,

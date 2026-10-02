@@ -36,11 +36,12 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "claude-3-opus-20240229": {"input": 15.0, "output": 75.0},
     "claude-3-opus-latest": {"input": 15.0, "output": 75.0},
     # Gemini
-    "gemini-3.8-flash": {"input": 0.10, "output": 0.40},  # verify on pricing page
-    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
-    "gemini-2.0-flash-exp": {"input": 0.10, "output": 0.40},
-    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
-    "gemini-1.5-pro": {"input": 1.25, "output": 5.0},
+    "gemini-3.8-flash": {"input": 0.10, "output": 0.40},  # UNVERIFIED, check https://ai.google.dev/pricing
+    "gemini-3.7-flash": {"input": 0.10, "output": 0.40},  # UNVERIFIED, check https://ai.google.dev/pricing
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},  # UNVERIFIED, check https://ai.google.dev/pricing
+    "gemini-2.0-flash-exp": {"input": 0.10, "output": 0.40},  # UNVERIFIED, check https://ai.google.dev/pricing
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},  # UNVERIFIED, check https://ai.google.dev/pricing
+    "gemini-1.5-pro": {"input": 1.25, "output": 5.0},  # UNVERIFIED, check https://ai.google.dev/pricing
     # Groq
     "openai/gpt-oss-120b": {"input": 0.15, "output": 0.60},  # verify on pricing page
     "grok-beta": {"input": 5.0, "output": 15.0},
@@ -49,6 +50,28 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # Fallback
     "default": {"input": 3.0, "output": 15.0},
 }
+
+UNVERIFIED_PRICING_MODELS = {
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-exp",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+}
+
+
+def is_price_unverified(model_name: Optional[str], provider: Optional[str] = None) -> bool:
+    """Returns True if the model pricing is unverified or on free tier."""
+    if not model_name:
+        return False
+    clean = model_name.strip().lower()
+    if provider and normalize_provider_name(provider) == "gemini":
+        return True
+    if "gemini" in clean or clean in UNVERIFIED_PRICING_MODELS:
+        return True
+    return False
+
 
 SYSTEM_PROMPT = """You control a web browser to achieve the user's goal. Follow these strict rules:
 1. You control a web browser to achieve the user's goal. The goal may be in English, Hindi, or Hinglish.
@@ -286,7 +309,7 @@ def get_provider(
     model_name: str,
     api_key: Optional[str] = None,
     client: Optional[Any] = None,
-    max_retries: int = 3,
+    max_retries: int = 4,
 ) -> LLMProvider:
     """Factory creating an LLMProvider instance based on provider name."""
     normalized = provider_name.strip().lower()
@@ -324,7 +347,7 @@ def decide(
     model_name: Optional[str] = None,
     client: Optional[Any] = None,
     api_key: Optional[str] = None,
-    max_retries: int = 3,
+    max_retries: int = 4,
     provider: Optional[str] = None,
 ) -> Decision:
     """Dispatches to the configured provider to select the next browser action."""
@@ -446,7 +469,7 @@ def reset_provider_exhaustion(provider_name: Optional[str] = None) -> None:
 
 def get_provider_priority() -> List[str]:
     """Returns ordered list of canonical provider names from PROVIDER_PRIORITY."""
-    raw = os.getenv("PROVIDER_PRIORITY", "grok,gemini")
+    raw = os.getenv("PROVIDER_PRIORITY", "groq,gemini")
     return [normalize_provider_name(p.strip()) for p in raw.split(",") if p.strip()]
 
 
@@ -515,6 +538,28 @@ def is_rate_limit_error(exc: Exception) -> bool:
     ))
 
 
+def is_provider_unavailable_error(exc: Exception) -> bool:
+    """Determines whether an exception corresponds to a 500/502/503/504 server unavailable error."""
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if code in (500, 502, 503, 504, "500", "502", "503", "504"):
+        return True
+    msg = str(exc).lower()
+    return any(phrase in msg for phrase in (
+        "503",
+        "500",
+        "502",
+        "504",
+        "unavailable",
+        "service unavailable",
+        "high demand",
+        "spikes in demand",
+        "server error",
+        "bad gateway",
+        "gateway timeout",
+        "overloaded",
+    ))
+
+
 __all__ = [
     "Decision",
     "LLMError",
@@ -526,6 +571,8 @@ __all__ = [
     "GroqProvider",
     "GrokProvider",
     "MODEL_PRICING",
+    "UNVERIFIED_PRICING_MODELS",
+    "is_price_unverified",
     "SYSTEM_PROMPT",
     "TOOLS",
     "estimate_cost",
@@ -541,4 +588,5 @@ __all__ = [
     "is_failover_enabled",
     "pick_active_provider",
     "is_rate_limit_error",
+    "is_provider_unavailable_error",
 ]

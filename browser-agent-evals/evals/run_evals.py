@@ -17,7 +17,12 @@ from rich.table import Table
 
 from agent.agent import Agent, RunResult
 from agent.browser import BrowserSession
-from agent.llm import get_model_for_provider, pick_active_provider
+from agent.llm import (
+    get_model_for_provider,
+    is_price_unverified,
+    normalize_provider_name,
+    pick_active_provider,
+)
 from evals.checks import CheckResult, get_checker
 
 logger = logging.getLogger(__name__)
@@ -33,6 +38,7 @@ FAILURE_CATEGORIES = [
     "language_misread",
     "safety_violation",
     "rate_limited",
+    "provider_unavailable",
     "api_error",
     "other",
 ]
@@ -92,8 +98,10 @@ def categorize_failure(
     if "invalid element id" in summary_lower or "hallucinated" in summary_lower:
         return "hallucinated_id"
 
-    # Rule 5: Rate limit or API / LLM Errors
+    # Rule 5: Rate limit, provider unavailable, or API / LLM Errors
     if status_lower == "error":
+        if "provider_unavailable" in summary_lower or any(p in summary_lower for p in ("503", "500", "502", "504", "unavailable", "high demand", "spikes in demand")):
+            return "provider_unavailable"
         if "rate limited" in summary_lower or "rate_limited" in summary_lower or "due to rate limits" in summary_lower:
             if "api error" in summary_lower and "rate limited" not in summary_lower:
                 return "api_error"
@@ -251,11 +259,14 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(results)
     infra_errors = sum(1 for r in results if r.get("actual_status") == "infra_error")
     rate_limited_count = sum(1 for r in results if r.get("failure_category") == "rate_limited")
-    eval_total = total - infra_errors - rate_limited_count
+    provider_unavailable_count = sum(1 for r in results if r.get("failure_category") == "provider_unavailable")
+    eval_total = total - infra_errors - rate_limited_count - provider_unavailable_count
 
     passed = sum(
         1 for r in results
-        if r["passed"] and r.get("actual_status") != "infra_error" and r.get("failure_category") != "rate_limited"
+        if r["passed"]
+        and r.get("actual_status") != "infra_error"
+        and r.get("failure_category") not in ("rate_limited", "provider_unavailable")
     )
     overall_rate = (passed / eval_total * 100.0) if eval_total > 0 else 0.0
 
@@ -265,10 +276,13 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         cat_items = [r for r in results if r["category"] == cat]
         cat_infra = sum(1 for r in cat_items if r.get("actual_status") == "infra_error")
         cat_rate_limited = sum(1 for r in cat_items if r.get("failure_category") == "rate_limited")
-        cat_eval_total = len(cat_items) - cat_infra - cat_rate_limited
+        cat_unavailable = sum(1 for r in cat_items if r.get("failure_category") == "provider_unavailable")
+        cat_eval_total = len(cat_items) - cat_infra - cat_rate_limited - cat_unavailable
         cat_passed = sum(
             1 for r in cat_items
-            if r["passed"] and r.get("actual_status") != "infra_error" and r.get("failure_category") != "rate_limited"
+            if r["passed"]
+            and r.get("actual_status") != "infra_error"
+            and r.get("failure_category") not in ("rate_limited", "provider_unavailable")
         )
         cat_rate = (cat_passed / cat_eval_total * 100.0) if cat_eval_total > 0 else 0.0
         category_metrics[cat] = {
@@ -276,6 +290,8 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "passed": cat_passed,
             "infra_errors": cat_infra,
             "rate_limited": cat_rate_limited,
+            "provider_unavailable": cat_unavailable,
+            "eval_total": cat_eval_total,
             "pass_rate_pct": round(cat_rate, 1),
         }
 
@@ -287,10 +303,13 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         m_total = len(m_items)
         m_infra = sum(1 for r in m_items if r.get("actual_status") == "infra_error")
         m_rate_limited = sum(1 for r in m_items if r.get("failure_category") == "rate_limited")
-        m_eval_total = m_total - m_infra - m_rate_limited
+        m_unavailable = sum(1 for r in m_items if r.get("failure_category") == "provider_unavailable")
+        m_eval_total = m_total - m_infra - m_rate_limited - m_unavailable
         m_passed = sum(
             1 for r in m_items
-            if r["passed"] and r.get("actual_status") != "infra_error" and r.get("failure_category") != "rate_limited"
+            if r["passed"]
+            and r.get("actual_status") != "infra_error"
+            and r.get("failure_category") not in ("rate_limited", "provider_unavailable")
         )
         m_rate = (m_passed / m_eval_total * 100.0) if m_eval_total > 0 else 0.0
         m_avg_cost = (sum(r.get("cost_usd", 0.0) for r in m_items) / m_total) if m_total > 0 else 0.0
@@ -299,6 +318,7 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "total": m_total,
             "infra_errors": m_infra,
             "rate_limited": m_rate_limited,
+            "provider_unavailable": m_unavailable,
             "passed": m_passed,
             "eval_total": m_eval_total,
             "pass_rate_pct": round(m_rate, 1),
@@ -314,10 +334,13 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         p_total = len(p_items)
         p_infra = sum(1 for r in p_items if r.get("actual_status") == "infra_error")
         p_rate_limited = sum(1 for r in p_items if r.get("failure_category") == "rate_limited")
-        p_eval_total = p_total - p_infra - p_rate_limited
+        p_unavailable = sum(1 for r in p_items if r.get("failure_category") == "provider_unavailable")
+        p_eval_total = p_total - p_infra - p_rate_limited - p_unavailable
         p_passed = sum(
             1 for r in p_items
-            if r["passed"] and r.get("actual_status") != "infra_error" and r.get("failure_category") != "rate_limited"
+            if r["passed"]
+            and r.get("actual_status") != "infra_error"
+            and r.get("failure_category") not in ("rate_limited", "provider_unavailable")
         )
         p_rate = (p_passed / p_eval_total * 100.0) if p_eval_total > 0 else 0.0
         p_avg_cost = (sum(r.get("cost_usd", 0.0) for r in p_items) / p_total) if p_total > 0 else 0.0
@@ -326,6 +349,7 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "total": p_total,
             "infra_errors": p_infra,
             "rate_limited": p_rate_limited,
+            "provider_unavailable": p_unavailable,
             "passed": p_passed,
             "eval_total": p_eval_total,
             "pass_rate_pct": round(p_rate, 1),
@@ -346,6 +370,7 @@ def compute_eval_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "eval_total": eval_total,
         "infra_errors_count": infra_errors,
         "rate_limited_count": rate_limited_count,
+        "provider_unavailable_count": provider_unavailable_count,
         "passed_runs": passed,
         "overall_pass_rate_pct": round(overall_rate, 1),
         "by_category": category_metrics,
@@ -398,6 +423,12 @@ def save_reports(
     is_mixed = summary.get("is_mixed_providers", False)
     header_title = "MIXED PROVIDERS" if is_mixed else f"{provider} / {model_name}"
 
+    has_unverified = is_price_unverified(model_name, provider) or any(
+        is_price_unverified(r.get("model_used") or r.get("model"), r.get("provider_used") or r.get("provider"))
+        for r in results
+    )
+    cost_display = "cost: estimated/unverified" if has_unverified else f"${summary['avg_cost_usd']:.4f}"
+
     md_lines = [
         f"# Evaluation Report: {header_title}",
         "",
@@ -412,9 +443,11 @@ def save_reports(
         f"- **Timestamp**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"- **Provider**: `{provider}`" + (" (MIXED)" if is_mixed else ""),
         f"- **Model**: `{model_name}`",
+        f"- **Cost**: `{cost_display}`",
         f"- **Git Commit**: `{git_commit}`",
         f"- **Overall Pass Rate**: **{summary['overall_pass_rate_pct']}%** ({summary['passed_runs']}/{summary.get('eval_total', summary['total_runs'])})",
         f"- **Rate Limited Runs (excluded from denominator)**: **{summary.get('rate_limited_count', 0)}**",
+        f"- **Provider Unavailable Runs (excluded from denominator)**: **{summary.get('provider_unavailable_count', 0)}**",
         f"- **Infrastructure Errors**: **{summary.get('infra_errors_count', 0)}**",
         f"- **Safety Failures**: **{summary['safety_failures_count']}**",
         "",
@@ -423,7 +456,7 @@ def save_reports(
         "| Metric | Value |",
         "| :--- | :--- |",
         f"| Average Steps | {summary['avg_steps']} |",
-        f"| Average Cost (USD) | ${summary['avg_cost_usd']:.4f} |",
+        f"| Average Cost (USD) | {cost_display} |",
         f"| Average Wall Time | {summary['avg_duration_s']:.2f}s |",
         "",
     ])
@@ -432,30 +465,34 @@ def save_reports(
     md_lines.extend([
         "### Performance by Provider",
         "",
-        "| Provider | Runs | Rate Limited | Infra Errors | Passed / Eval Total | Pass Rate | Avg Cost ($) | Avg Time (s) |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| Provider | Runs | Rate Limited | Provider Unavailable | Infra Errors | Passed / Eval Total | Pass Rate | Avg Cost ($) | Avg Time (s) |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ])
     for p_name, p_data in summary.get("by_provider", {}).items():
+        p_unverified = is_price_unverified(None, p_name)
+        p_cost_str = "cost: estimated/unverified" if p_unverified else f"${p_data['avg_cost_usd']:.4f}"
         md_lines.append(
-            f"| `{p_name}` | {p_data['total']} | {p_data.get('rate_limited', 0)} | {p_data.get('infra_errors', 0)} | "
+            f"| `{p_name}` | {p_data['total']} | {p_data.get('rate_limited', 0)} | {p_data.get('provider_unavailable', 0)} | {p_data.get('infra_errors', 0)} | "
             f"{p_data['passed']}/{p_data['eval_total']} | {p_data['pass_rate_pct']}% | "
-            f"${p_data['avg_cost_usd']:.4f} | {p_data['avg_duration_s']:.2f}s |"
+            f"{p_cost_str} | {p_data['avg_duration_s']:.2f}s |"
         )
 
     md_lines.extend([
         "",
         "### Performance by Model Used",
         "",
-        "| Model Used | Runs | Infra Errors | Passed / Eval Total | Success Rate | Avg Cost ($) | Avg Time (s) |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| Model Used | Runs | Provider Unavailable | Infra Errors | Passed / Eval Total | Success Rate | Avg Cost ($) | Avg Time (s) |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ])
 
     for m_name, m_data in summary.get("by_model", {}).items():
         eval_tot = m_data.get("eval_total", m_data["total"] - m_data.get("infra_errors", 0))
+        m_unverified = is_price_unverified(m_name)
+        m_cost_str = "cost: estimated/unverified" if m_unverified else f"${m_data['avg_cost_usd']:.4f}"
         md_lines.append(
-            f"| `{m_name}` | {m_data['total']} | {m_data.get('infra_errors', 0)} | "
+            f"| `{m_name}` | {m_data['total']} | {m_data.get('provider_unavailable', 0)} | {m_data.get('infra_errors', 0)} | "
             f"{m_data['passed']}/{eval_tot} | {m_data['pass_rate_pct']}% | "
-            f"${m_data['avg_cost_usd']:.4f} | {m_data['avg_duration_s']:.2f}s |"
+            f"{m_cost_str} | {m_data['avg_duration_s']:.2f}s |"
         )
 
     md_lines.extend(
@@ -524,11 +561,17 @@ def print_rich_results(
     """Renders evaluation results as formatted Rich tables in stdout."""
     is_mixed = summary.get("is_mixed_providers", False)
     title_suffix = " - MIXED PROVIDERS" if is_mixed else ""
+    has_unverified = is_price_unverified(model_name, provider) or any(
+        is_price_unverified(r.get("model_used") or r.get("model"), r.get("provider_used") or r.get("provider"))
+        for r in results
+    )
+    cost_display = "cost: estimated/unverified" if has_unverified else f"${summary['avg_cost_usd']:.4f}"
+
     console.print(
         Panel.fit(
             f"[bold cyan]WebPilot Evaluation Suite{title_suffix}[/bold cyan]\n"
             f"[yellow]Provider:[/yellow] {provider}{' (MIXED)' if is_mixed else ''} | [yellow]Model:[/yellow] {model_name} | [yellow]Commit:[/yellow] {git_commit}\n"
-            f"[yellow]Runs:[/yellow] {summary['total_runs']} | [yellow]Rate Limited:[/yellow] {summary.get('rate_limited_count', 0)} | [yellow]Infra Errors:[/yellow] {summary.get('infra_errors_count', 0)} | [yellow]Overall Pass Rate:[/yellow] [bold green]{summary['overall_pass_rate_pct']}%[/bold green]",
+            f"[yellow]Cost:[/yellow] {cost_display} | [yellow]Runs:[/yellow] {summary['total_runs']} | [yellow]Rate Limited:[/yellow] {summary.get('rate_limited_count', 0)} | [yellow]Provider Unavailable:[/yellow] {summary.get('provider_unavailable_count', 0)} | [yellow]Infra Errors:[/yellow] {summary.get('infra_errors_count', 0)} | [yellow]Overall Pass Rate:[/yellow] [bold green]{summary['overall_pass_rate_pct']}%[/bold green]",
             border_style="cyan",
         )
     )
@@ -548,6 +591,11 @@ def print_rich_results(
     for r in results:
         res_str = "[green]PASS[/green]" if r["passed"] else "[bold red]FAIL[/bold red]"
         fail_str = r["failure_category"] if r["failure_category"] else "-"
+        r_cost = (
+            "cost: estimated/unverified"
+            if is_price_unverified(r.get("model_used") or r.get("model"), r.get("provider_used") or r.get("provider"))
+            else f"${r['cost_usd']:.4f}"
+        )
         row = [
             r["test_id"],
             r["category"],
@@ -558,7 +606,7 @@ def print_rich_results(
             res_str,
             r["actual_status"],
             str(r["steps"]),
-            f"${r['cost_usd']:.4f}",
+            r_cost,
             f"{r['duration_s']}s",
             fail_str,
         ])
@@ -570,6 +618,7 @@ def print_rich_results(
     provider_table.add_column("Provider", style="bold")
     provider_table.add_column("Runs", justify="center")
     provider_table.add_column("Rate Limited", justify="center")
+    provider_table.add_column("Provider Unavailable", justify="center")
     provider_table.add_column("Infra Errors", justify="center")
     provider_table.add_column("Passed / Eval Total", justify="center")
     provider_table.add_column("Pass Rate", justify="right")
@@ -577,14 +626,17 @@ def print_rich_results(
     provider_table.add_column("Avg Time", justify="right")
 
     for p_name, p_data in summary.get("by_provider", {}).items():
+        p_unverified = is_price_unverified(None, p_name)
+        p_cost_str = "cost: estimated/unverified" if p_unverified else f"${p_data['avg_cost_usd']:.4f}"
         provider_table.add_row(
             p_name,
             str(p_data["total"]),
             str(p_data.get("rate_limited", 0)),
+            str(p_data.get("provider_unavailable", 0)),
             str(p_data.get("infra_errors", 0)),
             f"{p_data['passed']}/{p_data['eval_total']}",
             f"{p_data['pass_rate_pct']}%",
-            f"${p_data['avg_cost_usd']:.4f}",
+            p_cost_str,
             f"{p_data['avg_duration_s']:.2f}s",
         )
     console.print(provider_table)
@@ -592,6 +644,7 @@ def print_rich_results(
     model_table = Table(title="Performance by Model Used", border_style="magenta")
     model_table.add_column("Model Used", style="bold")
     model_table.add_column("Runs", justify="center")
+    model_table.add_column("Provider Unavailable", justify="center")
     model_table.add_column("Infra Errors", justify="center")
     model_table.add_column("Passed / Eval Total", justify="center")
     model_table.add_column("Success Rate", justify="right")
@@ -600,13 +653,16 @@ def print_rich_results(
 
     for m_name, m_data in summary.get("by_model", {}).items():
         eval_tot = m_data.get("eval_total", m_data["total"] - m_data.get("infra_errors", 0))
+        m_unverified = is_price_unverified(m_name)
+        m_cost_str = "cost: estimated/unverified" if m_unverified else f"${m_data['avg_cost_usd']:.4f}"
         model_table.add_row(
             m_name,
             str(m_data["total"]),
+            str(m_data.get("provider_unavailable", 0)),
             str(m_data.get("infra_errors", 0)),
             f"{m_data['passed']}/{eval_tot}",
             f"{m_data['pass_rate_pct']}%",
-            f"${m_data['avg_cost_usd']:.4f}",
+            m_cost_str,
             f"{m_data['avg_duration_s']:.2f}s",
         )
     console.print(model_table)
@@ -634,9 +690,10 @@ def print_rich_results(
 
     metrics_panel = (
         f"[bold]Average Steps:[/] {summary['avg_steps']}  |  "
-        f"[bold]Average Cost:[/] ${summary['avg_cost_usd']:.4f}  |  "
+        f"[bold]Average Cost:[/] {cost_display}  |  "
         f"[bold]Average Duration:[/] {summary['avg_duration_s']}s  |  "
         f"[bold]Rate Limited:[/] {summary.get('rate_limited_count', 0)}  |  "
+        f"[bold]Provider Unavailable:[/] {summary.get('provider_unavailable_count', 0)}  |  "
         f"[bold]Safety Failures:[/] [{'red' if summary['safety_failures_count'] > 0 else 'green'}]{summary['safety_failures_count']}[/]"
     )
     console.print(Panel(metrics_panel, border_style="yellow"))
@@ -655,7 +712,8 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    provider = args.provider or os.getenv("PROVIDER", "anthropic")
+    raw_provider = args.provider or os.getenv("PROVIDER", "anthropic")
+    provider = normalize_provider_name(raw_provider)
     model_name = args.model or get_model_for_provider(provider)
     git_commit = get_git_commit_hash()
 

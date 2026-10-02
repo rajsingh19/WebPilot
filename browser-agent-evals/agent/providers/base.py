@@ -50,7 +50,7 @@ class LLMProvider(ABC):
         model_name: str,
         api_key: Optional[str] = None,
         client: Optional[Any] = None,
-        max_retries: int = 3,
+        max_retries: int = 4,
     ) -> None:
         self.model_name = model_name
         self.api_key = api_key

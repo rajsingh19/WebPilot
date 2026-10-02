@@ -13,12 +13,17 @@ from agent.llm import (
     LLMError,
     get_model_for_provider,
     get_provider_priority,
+    is_price_unverified,
     is_provider_exhausted,
+    is_provider_unavailable_error,
     mark_provider_exhausted,
+    normalize_provider_name,
     pick_active_provider,
     reset_provider_exhaustion,
 )
 from agent.providers.base import LLMError
+from agent.providers.gemini_provider import GeminiProvider
+from agent.providers.groq_provider import GroqProvider
 from evals.compare import compare_runs, compute_group_metrics, load_result_file
 from evals.run_evals import compute_eval_summary, run_single_eval, save_reports
 
@@ -404,3 +409,146 @@ class TestCompareGroupingByProviderModel:
 
         # Run compare_runs - must succeed and execute without crashing
         compare_runs([str(file1), str(file2)])
+
+
+class TestProviderUnavailableAndPricing:
+    """Tests for provider unavailable handling, retry backoff, and unverified pricing display."""
+
+    def test_provider_unavailable_runs_excluded_from_denominator(self):
+        """Runs with failure_category provider_unavailable are excluded from pass-rate denominator."""
+        results = [
+            {
+                "test_id": "test_1",
+                "category": "functional",
+                "provider": "gemini",
+                "model": "gemini-3.8-flash",
+                "passed": True,
+                "actual_status": "success",
+                "steps": 3,
+                "cost_usd": 0.0001,
+                "duration_s": 2.0,
+                "failure_category": "",
+            },
+            {
+                "test_id": "test_2",
+                "category": "functional",
+                "provider": "gemini",
+                "model": "gemini-3.8-flash",
+                "passed": False,
+                "actual_status": "error",
+                "steps": 0,
+                "cost_usd": 0.0,
+                "duration_s": 1.0,
+                "failure_category": "provider_unavailable",
+            },
+            {
+                "test_id": "test_3",
+                "category": "functional",
+                "provider": "gemini",
+                "model": "gemini-3.8-flash",
+                "passed": False,
+                "actual_status": "failed",
+                "steps": 4,
+                "cost_usd": 0.0002,
+                "duration_s": 3.0,
+                "failure_category": "wrong_element",
+            },
+        ]
+
+        summary = compute_eval_summary(results)
+
+        assert summary["total_runs"] == 3
+        assert summary["provider_unavailable_count"] == 1
+        # Denominator excludes provider_unavailable: eval_total = 3 - 1 = 2
+        assert summary["eval_total"] == 2
+        assert summary["passed_runs"] == 1
+        # Pass rate is 1 / 2 = 50.0%
+        assert summary["overall_pass_rate_pct"] == 50.0
+
+        # Check compare tool's group metrics as well
+        metrics = compute_group_metrics(results)
+        assert metrics["total_runs"] == 3
+        assert metrics["provider_unavailable_count"] == 1
+        assert metrics["eval_total"] == 2
+        assert metrics["overall_pass_rate_pct"] == 50.0
+
+    def test_unverified_pricing_eval_report_header(self, tmp_path):
+        """When model pricing is unverified, report header displays 'cost: estimated/unverified'."""
+        assert is_price_unverified("gemini-3.8-flash", "gemini") is True
+
+        results = [
+            {
+                "test_id": "test_1",
+                "category": "functional",
+                "provider": "gemini",
+                "model": "gemini-3.8-flash",
+                "passed": True,
+                "actual_status": "success",
+                "steps": 3,
+                "cost_usd": 0.0001,
+                "duration_s": 2.0,
+                "failure_category": "",
+                "checker_detail": "Passed",
+            }
+        ]
+
+        summary = compute_eval_summary(results)
+        json_path, md_path = save_reports(
+            results=results,
+            summary=summary,
+            provider="gemini",
+            model_name="gemini-3.8-flash",
+            git_commit="abcdef1",
+            output_dir=str(tmp_path),
+        )
+
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_content = f.read()
+
+        assert "cost: estimated/unverified" in md_content
+        assert "- **Cost**: `cost: estimated/unverified`" in md_content
+        assert "| Average Cost (USD) | cost: estimated/unverified |" in md_content
+
+    @patch("agent.agent.decide")
+    def test_503_raises_and_marked_provider_unavailable(
+        self, mock_decide, mock_browser_session, tmp_path
+    ):
+        """When 503 is returned after retries, Agent sets failure_category to provider_unavailable."""
+        mock_decide.side_effect = LLMError("503 The model is overloaded. Please try again later.")
+
+        agent = Agent(
+            provider="gemini",
+            model_name="gemini-3.8-flash",
+            browser_session=mock_browser_session,
+            traces_root=str(tmp_path),
+            failover_enabled=False,
+        )
+
+        result = agent.run(goal="Test 503", start_url="https://example.com")
+
+        assert result.status == "error"
+        assert result.failure_category == "provider_unavailable"
+        assert "unavailable" in result.summary.lower()
+
+        trace_file = Path(result.trace_file)
+        with open(trace_file, "r", encoding="utf-8") as tf:
+            trace_data = json.load(tf)
+        assert trace_data["failure_category"] == "provider_unavailable"
+
+    def test_grok_to_groq_normalization(self):
+        """Provider name 'grok' is normalized to 'groq' everywhere."""
+        assert normalize_provider_name("grok") == "groq"
+        assert normalize_provider_name("groq") == "groq"
+        assert normalize_provider_name("GROK") == "groq"
+        assert normalize_provider_name("xai") == "groq"
+
+        agent = Agent(provider="grok")
+        assert agent.provider == "groq"
+
+    def test_gemini_and_groq_default_4_retries(self):
+        """Providers have max_retries default set to 4."""
+        gemini = GeminiProvider(model_name="gemini-3.8-flash", api_key="dummy")
+        assert gemini.max_retries == 4
+
+        groq = GroqProvider(model_name="openai/gpt-oss-120b", api_key="dummy")
+        assert groq.max_retries == 4

@@ -28,6 +28,7 @@ from agent.llm import (
     get_provider_priority,
     is_failover_enabled,
     is_provider_exhausted,
+    is_provider_unavailable_error,
     is_rate_limit_error,
     mark_provider_exhausted,
     normalize_provider_name,
@@ -95,11 +96,11 @@ class Agent:
         traces_root: str = "traces",
         failover_enabled: Optional[bool] = None,
     ) -> None:
-        self.provider = provider
+        self.provider = normalize_provider_name(provider) if provider else None
         self.model_name = model_name
 
         fb_prov = fallback_provider if fallback_provider is not None else os.getenv("FALLBACK_PROVIDER", "")
-        self.fallback_provider: Optional[str] = fb_prov.strip() if fb_prov else None
+        self.fallback_provider: Optional[str] = normalize_provider_name(fb_prov.strip()) if fb_prov.strip() else None
 
         fb_model = fallback_model_name if fallback_model_name is not None else os.getenv("FALLBACK_MODEL_NAME", "")
         self.fallback_model_name: Optional[str] = fb_model.strip() if fb_model else None
@@ -387,7 +388,17 @@ class Agent:
                             logger.error("Both providers failed: %s", final_summary)
                             break
                     else:
-                        if fallback_used:
+                        if is_provider_unavailable_error(exc):
+                            final_status = "error"
+                            failure_category = "provider_unavailable"
+                            final_summary = f"Provider '{current_provider}' unavailable: {exc}"
+                            logger.error(
+                                "Provider '%s' unavailable (step %d): %s",
+                                current_provider,
+                                step_no,
+                                exc,
+                            )
+                        elif fallback_used:
                             final_status = "infra_error"
                             final_summary = f"Fallback provider failed: {exc}"
                         elif isinstance(exc, LLMInfraError) and (bool(self.fallback_provider)):
