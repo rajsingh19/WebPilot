@@ -40,6 +40,8 @@ class Decision:
     reasoning: str
     input_tokens: int
     output_tokens: int
+    cost_usd: Optional[float] = None
+    upstream_provider: Optional[str] = None
 
 
 class LLMProvider(ABC):

@@ -27,6 +27,7 @@ from agent.llm import (
     get_model_for_provider,
     get_provider_priority,
     is_failover_enabled,
+    is_price_unverified,
     is_provider_exhausted,
     is_provider_unavailable_error,
     is_rate_limit_error,
@@ -60,6 +61,10 @@ class RunResult:
     provider_used: Optional[str] = None
     failover_happened: bool = False
     failure_category: Optional[str] = None
+    llm_calls: int = 0
+    has_real_cost: bool = False
+    upstream_provider: Optional[str] = None
+    navigation_error: Optional[str] = None
 
 
 @dataclass
@@ -78,6 +83,7 @@ class StepRecord:
     input_tokens: int
     output_tokens: int
     latency_ms: int
+    upstream_provider: Optional[str] = None
 
 
 class Agent:
@@ -257,13 +263,18 @@ class Agent:
         final_summary = "Run terminated without conclusion."
         asked_question: Optional[str] = None
         current_url = start_url
+        total_llm_calls = 0
+        has_real_cost = False
+        latest_upstream_provider: Optional[str] = None
 
         try:
             session = self._get_or_create_session()
+            navigation_error: Optional[str] = None
             if start_url:
                 logger.info("Navigating to start URL: %s", start_url)
                 nav_res = session.goto(start_url)
                 if not nav_res.ok:
+                    navigation_error = nav_res.message
                     logger.warning("Failed navigating to start_url: %s", nav_res.message)
 
             step_no = 0
@@ -294,6 +305,7 @@ class Agent:
                 # 2. LLM Decision
                 llm_start = time.monotonic()
                 decision = None
+                total_llm_calls += 1
                 try:
                     decision = decide(
                         goal=goal,
@@ -368,6 +380,7 @@ class Agent:
                         current_model = self.fallback_model_name
 
                         try:
+                            total_llm_calls += 1
                             decision = decide(
                                 goal=goal,
                                 history=history_entries,
@@ -423,10 +436,21 @@ class Agent:
                     }
                 provider_usage[current_provider]["input_tokens"] += decision.input_tokens
                 provider_usage[current_provider]["output_tokens"] += decision.output_tokens
-                step_cost = estimate_cost(current_model, decision.input_tokens, decision.output_tokens)
+                if getattr(decision, "cost_usd", None) is not None:
+                    step_cost = float(decision.cost_usd)
+                    has_real_cost = True
+                else:
+                    if is_price_unverified(current_model, current_provider):
+                        step_cost = 0.0
+                    else:
+                        step_cost = estimate_cost(current_model, decision.input_tokens, decision.output_tokens)
                 provider_usage[current_provider]["cost_usd"] = round(
                     provider_usage[current_provider]["cost_usd"] + step_cost, 6
                 )
+
+                step_upstream = getattr(decision, "upstream_provider", None)
+                if step_upstream:
+                    latest_upstream_provider = step_upstream
 
                 action_name = decision.tool_name
                 action_args = decision.tool_args
@@ -451,6 +475,7 @@ class Agent:
                             input_tokens=decision.input_tokens,
                             output_tokens=decision.output_tokens,
                             latency_ms=llm_latency_ms,
+                            upstream_provider=step_upstream,
                         )
                     )
                     break
@@ -476,6 +501,7 @@ class Agent:
                                 input_tokens=decision.input_tokens,
                                 output_tokens=decision.output_tokens,
                                 latency_ms=llm_latency_ms,
+                                upstream_provider=step_upstream,
                             )
                         )
                         break
@@ -498,6 +524,7 @@ class Agent:
                                     input_tokens=decision.input_tokens,
                                     output_tokens=decision.output_tokens,
                                     latency_ms=llm_latency_ms,
+                                    upstream_provider=step_upstream,
                                 )
                             )
                             break
@@ -523,6 +550,7 @@ class Agent:
                                     input_tokens=decision.input_tokens,
                                     output_tokens=decision.output_tokens,
                                     latency_ms=llm_latency_ms,
+                                    upstream_provider=step_upstream,
                                 )
                             )
                             step_limiter.step()
@@ -558,6 +586,7 @@ class Agent:
                                     input_tokens=decision.input_tokens,
                                     output_tokens=decision.output_tokens,
                                     latency_ms=llm_latency_ms,
+                                    upstream_provider=step_upstream,
                                 )
                             )
                             step_limiter.step()
@@ -601,6 +630,7 @@ class Agent:
                             input_tokens=decision.input_tokens,
                             output_tokens=decision.output_tokens,
                             latency_ms=llm_latency_ms,
+                            upstream_provider=step_upstream,
                         )
                     )
 
@@ -637,6 +667,7 @@ class Agent:
                             input_tokens=decision.input_tokens,
                             output_tokens=decision.output_tokens,
                             latency_ms=llm_latency_ms,
+                            upstream_provider=step_upstream,
                         )
                     )
                     break
@@ -695,6 +726,7 @@ class Agent:
                         input_tokens=decision.input_tokens,
                         output_tokens=decision.output_tokens,
                         latency_ms=llm_latency_ms,
+                        upstream_provider=step_upstream,
                     )
                 )
                 step_limiter.step()
@@ -717,6 +749,7 @@ class Agent:
             "model": current_model,
             "provider_used": current_provider,
             "model_used": current_model,
+            "upstream_provider": latest_upstream_provider,
             "failover_happened": failover_happened,
             "primary_model": primary_model,
             "fallback_used": fallback_used,
@@ -733,6 +766,9 @@ class Agent:
             "output_tokens": total_output_tokens,
             "estimated_cost_usd": cost_usd,
             "hallucinated_ids_count": hallucinated_ids,
+            "llm_calls": total_llm_calls,
+            "has_real_cost": has_real_cost,
+            "navigation_error": navigation_error,
             "steps": [asdict(record) for record in step_records],
         }
 
@@ -761,6 +797,10 @@ class Agent:
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,
             per_provider=provider_usage,
+            llm_calls=total_llm_calls,
+            has_real_cost=has_real_cost,
+            upstream_provider=latest_upstream_provider,
+            navigation_error=navigation_error,
         )
 
 
@@ -774,9 +814,9 @@ if __name__ == "__main__":
     parser.add_argument("--goal", type=str, required=True, help="Goal for the browser agent")
     parser.add_argument("--url", type=str, required=True, help="Starting URL")
     parser.add_argument("--headed", action="store_true", help="Launch browser in headed mode")
-    parser.add_argument("--provider", type=str, default=None, help="LLM Provider (anthropic, gemini, groq)")
+    parser.add_argument("--provider", type=str, default=None, help="LLM Provider (anthropic, gemini, groq, openrouter)")
     parser.add_argument("--model", type=str, default=None, help="Model name")
-    parser.add_argument("--fallback-provider", type=str, default=None, help="Fallback LLM Provider (anthropic, gemini, groq)")
+    parser.add_argument("--fallback-provider", type=str, default=None, help="Fallback LLM Provider (anthropic, gemini, groq, openrouter)")
     parser.add_argument("--fallback-model", type=str, default=None, help="Fallback model name")
     parser.add_argument("--max-steps", type=int, default=12, help="Maximum execution steps")
 
@@ -794,7 +834,7 @@ if __name__ == "__main__":
     )
 
     agent = Agent(
-        provider=args.provider,
+        provider=args.provider or os.getenv("PROVIDER"),
         model_name=args.model,
         fallback_provider=args.fallback_provider,
         fallback_model_name=args.fallback_model,

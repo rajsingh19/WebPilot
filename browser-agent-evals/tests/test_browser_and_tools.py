@@ -35,6 +35,10 @@ class TestSystemPromptAndTools:
             "If the goal is to report something (e.g. an error message), "
             "call finish(success=true) with that exact text in summary."
         ) in SYSTEM_PROMPT
+        assert (
+            "Never call ask_user on the first step or before you have looked at the page. "
+            "Use ask_user only right before an irreversible action."
+        ) in SYSTEM_PROMPT
 
     def test_select_option_tool_definition(self):
         select_tool = next((t for t in TOOLS if t["name"] == "select_option"), None)
@@ -198,3 +202,62 @@ class TestGroqToolUseFailedRetry:
                 tools=TOOLS,
             )
         assert provider.client.chat.completions.create.call_count == 1
+
+
+class TestBrowserGoto:
+    """Tests for BrowserSession.goto retry on timeout with wait_until=domcontentloaded and 45s timeout."""
+
+    def test_goto_uses_domcontentloaded_and_45s_timeout(self):
+        session = BrowserSession(headless=True)
+        mock_page = MagicMock()
+        session._page = mock_page
+
+        res = session.goto("https://example.com")
+
+        assert res.ok is True
+        assert "Navigated to https://example.com" in res.message
+        mock_page.goto.assert_called_once_with(
+            "https://example.com",
+            timeout=45000,
+            wait_until="domcontentloaded",
+        )
+
+    def test_goto_retries_once_on_timeout_and_succeeds(self):
+        session = BrowserSession(headless=True)
+        mock_page = MagicMock()
+        session._page = mock_page
+
+        # Attempt 1: Timeout error, Attempt 2: Success
+        mock_page.goto.side_effect = [
+            Exception("Page.goto: Timeout 45000ms exceeded."),
+            None,
+        ]
+
+        res = session.goto("https://example.com")
+
+        assert res.ok is True
+        assert "Navigated to https://example.com" in res.message
+        assert mock_page.goto.call_count == 2
+        mock_page.goto.assert_called_with(
+            "https://example.com",
+            timeout=45000,
+            wait_until="domcontentloaded",
+        )
+
+    def test_goto_fails_after_retry_on_timeout(self):
+        session = BrowserSession(headless=True)
+        mock_page = MagicMock()
+        session._page = mock_page
+
+        # Both attempts time out
+        mock_page.goto.side_effect = [
+            Exception("Page.goto: Timeout 45000ms exceeded."),
+            Exception("Page.goto: Timeout 45000ms exceeded."),
+        ]
+
+        res = session.goto("https://example.com")
+
+        assert res.ok is False
+        assert "after retry" in res.message
+        assert "Timeout 45000ms exceeded" in res.message
+        assert mock_page.goto.call_count == 2

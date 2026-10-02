@@ -455,13 +455,30 @@ class BrowserSession:
         if not target_url.startswith(("http://", "https://", "about:", "file://")):
             target_url = "https://" + target_url
 
-        try:
-            self._page.goto(target_url, timeout=30000)
-            self._wait_network_idle()
-            return ActionResult(ok=True, message=f"Navigated to {target_url}.")
-        except Exception as exc:
-            logger.error("Error navigating to %s: %s", target_url, exc)
-            return ActionResult(ok=False, message=f"Failed to navigate to {target_url}: {exc}")
+        last_error = None
+        for attempt in range(1, 3):
+            try:
+                self._page.goto(target_url, timeout=45000, wait_until="domcontentloaded")
+                self._wait_network_idle()
+                return ActionResult(ok=True, message=f"Navigated to {target_url}.")
+            except Exception as exc:
+                last_error = exc
+                is_timeout = "timeout" in str(exc).lower() or isinstance(exc, TimeoutError)
+                if is_timeout and attempt == 1:
+                    logger.warning(
+                        "Navigation to %s timed out on attempt 1. Retrying navigation once...",
+                        target_url,
+                    )
+                    continue
+                logger.error("Error navigating to %s (attempt %d/2): %s", target_url, attempt, exc)
+                break
+
+        msg = (
+            f"Failed to navigate to {target_url} after retry: {last_error}"
+            if is_timeout
+            else f"Failed to navigate to {target_url}: {last_error}"
+        )
+        return ActionResult(ok=False, message=msg)
 
     def scroll(self, direction: str) -> ActionResult:
         """Scrolls the page in the specified direction ('up', 'down', 'top', 'bottom')."""

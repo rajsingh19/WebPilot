@@ -10,6 +10,7 @@ from agent.providers.base import (
 )
 from agent.providers.gemini_provider import GeminiProvider
 from agent.providers.groq_provider import GroqProvider
+from agent.providers.openrouter_provider import OpenRouterProvider
 
 # Backward compatibility alias
 GrokProvider = GroqProvider
@@ -24,4 +25,6 @@ __all__ = [
     "GeminiProvider",
     "GroqProvider",
     "GrokProvider",
+    "OpenRouterProvider",
 ]
+

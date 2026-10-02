@@ -88,6 +88,55 @@ class TestEvalRunnerLogic:
         )
         assert cat == "wrong_element"
 
+    def test_categorize_failure_navigation_timeout_in_check_detail_classified_as_slow_page(self):
+        cat = categorize_failure(
+            test_category="functional",
+            run_status="failed",
+            summary="element not found",
+            check_detail="Navigation timeout on goto: Timeout 30000ms exceeded",
+        )
+        assert cat == "slow_page"
+
+    def test_categorize_failure_navigation_timeout_in_trace_classified_as_slow_page_not_wrong_element(self):
+        trace_data = {
+            "navigation_error": "Failed to navigate to https://the-internet.herokuapp.com/dropdown: Page.goto: Timeout 30000ms exceeded.",
+            "steps": [
+                {
+                    "step": 1,
+                    "action": "finish",
+                    "result": "Failed: No dropdown element ID available in observation.",
+                }
+            ],
+        }
+        cat = categorize_failure(
+            test_category="functional",
+            run_status="failed",
+            summary="Failed: No dropdown element ID available in observation.",
+            check_detail="Expected dropdown value '2', but found ''",
+            trace_data=trace_data,
+        )
+        assert cat == "slow_page"
+
+    def test_categorize_failure_goto_step_timeout_in_trace_classified_as_slow_page(self):
+        trace_data = {
+            "steps": [
+                {
+                    "step": 1,
+                    "action": "goto",
+                    "args": {"url": "https://example.com"},
+                    "result": "Page.goto: Timeout 30000ms exceeded",
+                }
+            ]
+        }
+        cat = categorize_failure(
+            test_category="functional",
+            run_status="failed",
+            summary="Wrong button clicked",
+            check_detail="Wrong element selected",
+            trace_data=trace_data,
+        )
+        assert cat == "slow_page"
+
 
 class TestReportingAndSummary:
     """Tests for metrics aggregation and report generation."""
@@ -286,3 +335,208 @@ class TestCompareTool:
             max_steps=25,
         )
         assert record["passed"] is True
+
+
+class TestBudgetAndEstimates:
+    """Tests for --max-llm-calls, budget skipping, LLM call logging, and daily request limit estimation."""
+
+    def test_compute_eval_summary_excludes_skipped_budget(self):
+        """Tests marked skipped_budget are excluded from the pass-rate denominator."""
+        results = [
+            {
+                "test_id": "test_1",
+                "category": "functional",
+                "passed": True,
+                "actual_status": "success",
+                "steps": 2,
+                "llm_calls": 2,
+                "cost_usd": 0.001,
+                "duration_s": 2.0,
+                "failure_category": "",
+            },
+            {
+                "test_id": "test_2",
+                "category": "functional",
+                "passed": False,
+                "actual_status": "failed",
+                "steps": 4,
+                "llm_calls": 4,
+                "cost_usd": 0.002,
+                "duration_s": 3.0,
+                "failure_category": "wrong_element",
+            },
+            {
+                "test_id": "test_3",
+                "category": "functional",
+                "passed": False,
+                "actual_status": "skipped_budget",
+                "steps": 0,
+                "llm_calls": 0,
+                "cost_usd": 0.0,
+                "duration_s": 0.0,
+                "failure_category": "skipped_budget",
+            },
+            {
+                "test_id": "test_4",
+                "category": "functional",
+                "passed": False,
+                "actual_status": "skipped_budget",
+                "steps": 0,
+                "llm_calls": 0,
+                "cost_usd": 0.0,
+                "duration_s": 0.0,
+                "failure_category": "skipped_budget",
+            },
+        ]
+
+        summary = compute_eval_summary(results)
+
+        assert summary["total_runs"] == 4
+        assert summary["skipped_budget_count"] == 2
+        # eval_total should exclude the 2 skipped runs: 4 - 2 = 2
+        assert summary["eval_total"] == 2
+        assert summary["passed_runs"] == 1
+        # Pass rate is 1 / 2 = 50.0%
+        assert summary["overall_pass_rate_pct"] == 50.0
+        assert summary["total_llm_calls"] == 6
+
+    @patch("evals.run_evals.save_reports")
+    @patch("evals.run_evals.print_rich_results")
+    @patch("evals.run_evals.run_single_eval")
+    def test_max_llm_calls_stops_cleanly_marks_remaining_and_saves_valid_report(
+        self, mock_run_single_eval, mock_print_rich, mock_save_reports, capsys, monkeypatch, tmp_path
+    ):
+        """Suite stops cleanly when max_llm_calls is reached, remaining are marked skipped_budget, valid report is saved."""
+        from evals.run_evals import main
+
+        # Simulate run 1 using 3 LLM calls
+        mock_run_single_eval.return_value = {
+            "test_id": "test_1",
+            "category": "functional",
+            "passed": True,
+            "actual_status": "success",
+            "steps": 3,
+            "llm_calls": 3,
+            "cost_usd": 0.001,
+            "duration_s": 1.5,
+            "failure_category": "",
+            "checker_detail": "Passed",
+            "summary": "Completed",
+            "final_url": "https://example.com",
+            "trace_file": None,
+            "provider": "groq",
+            "model": "openai/gpt-oss-120b",
+        }
+        mock_save_reports.return_value = (Path("test.json"), Path("test.md"))
+
+        test_data = [
+            {"id": "test_1", "category": "functional", "goal": "g1", "start_url": "u1", "check": "c1", "expected_status": "success"},
+            {"id": "test_2", "category": "functional", "goal": "g2", "start_url": "u2", "check": "c2", "expected_status": "success"},
+            {"id": "test_3", "category": "functional", "goal": "g3", "start_url": "u3", "check": "c3", "expected_status": "success"},
+        ]
+        tests_file = tmp_path / "tests.json"
+        with open(tests_file, "w", encoding="utf-8") as f:
+            json.dump(test_data, f)
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "run_evals.py",
+                "--tests-file",
+                str(tests_file),
+                "--max-llm-calls",
+                "3",
+                "--provider",
+                "groq",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+
+        assert excinfo.value.code == 0
+
+        # Only 1 test actually ran
+        assert mock_run_single_eval.call_count == 1
+
+        # Check save_reports was called with is_invalid_run=False
+        _, kwargs = mock_save_reports.call_args
+        assert kwargs["is_invalid_run"] is False
+
+        # Results passed to save_reports should have 3 records (1 ran, 2 skipped_budget)
+        results = kwargs["results"]
+        assert len(results) == 3
+        assert results[0]["actual_status"] == "success"
+        assert results[1]["actual_status"] == "skipped_budget"
+        assert results[1]["failure_category"] == "skipped_budget"
+        assert results[2]["actual_status"] == "skipped_budget"
+        assert results[2]["failure_category"] == "skipped_budget"
+
+        captured = capsys.readouterr()
+        # Verify LLM calls per run and running total printed
+        assert "LLM calls used: 3 (run) | 3 / 3 (running total)" in captured.out
+        # Verify clean stop message
+        assert "Budget limit reached (3 >= 3 LLM calls). Stopping suite cleanly." in captured.out
+
+    @patch("evals.run_evals.save_reports")
+    @patch("evals.run_evals.print_rich_results")
+    @patch("evals.run_evals.run_single_eval")
+    def test_estimate_and_daily_limit_warning(
+        self, mock_run_single_eval, mock_print_rich, mock_save_reports, capsys, monkeypatch, tmp_path
+    ):
+        """Prints estimate before starting and warns if estimate exceeds DAILY_REQUEST_LIMIT_<PROVIDER>."""
+        from evals.run_evals import main
+
+        mock_run_single_eval.return_value = {
+            "test_id": "test_1",
+            "category": "functional",
+            "passed": True,
+            "actual_status": "success",
+            "steps": 2,
+            "llm_calls": 2,
+            "cost_usd": 0.001,
+            "duration_s": 1.0,
+            "failure_category": "",
+            "checker_detail": "Passed",
+            "summary": "Completed",
+            "final_url": "https://example.com",
+            "trace_file": None,
+            "provider": "groq",
+            "model": "openai/gpt-oss-120b",
+        }
+        mock_save_reports.return_value = (Path("test.json"), Path("test.md"))
+
+        test_data = [
+            {"id": "t1", "category": "functional", "goal": "g", "start_url": "u", "check": "c", "expected_status": "success"},
+            {"id": "t2", "category": "functional", "goal": "g", "start_url": "u", "check": "c", "expected_status": "success"},
+        ]
+        tests_file = tmp_path / "tests.json"
+        with open(tests_file, "w", encoding="utf-8") as f:
+            json.dump(test_data, f)
+
+        monkeypatch.setenv("DAILY_REQUEST_LIMIT_GROQ", "10")
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "run_evals.py",
+                "--tests-file",
+                str(tests_file),
+                "--provider",
+                "groq",
+                "--repeat",
+                "1",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+
+        assert excinfo.value.code == 0
+        captured = capsys.readouterr()
+        out_text = " ".join(captured.out.split())
+        # 2 tests x 1 repeat x 8 avg_steps = 16 calls
+        assert "Estimated LLM calls: 2 tests x 1 repeat x ~8 avg_steps = ~16 calls" in out_text
+        # 16 > 10, so warning must be printed
+        assert "WARNING: Estimated LLM calls (~16) exceeds known daily limit of 10 for groq (DAILY_REQUEST_LIMIT_GROQ)" in out_text
+
+

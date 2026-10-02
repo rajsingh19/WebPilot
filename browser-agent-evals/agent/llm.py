@@ -18,6 +18,7 @@ from agent.providers.base import (
 )
 from agent.providers.gemini_provider import GeminiProvider
 from agent.providers.groq_provider import GroqProvider
+from agent.providers.openrouter_provider import OpenRouterProvider
 
 # Backward compatibility alias
 GrokProvider = GroqProvider
@@ -61,13 +62,24 @@ UNVERIFIED_PRICING_MODELS = {
 }
 
 
+OPENROUTER_PRICING_MODELS: set = set()
+
+
 def is_price_unverified(model_name: Optional[str], provider: Optional[str] = None) -> bool:
     """Returns True if the model pricing is unverified or on free tier."""
+    norm_p = normalize_provider_name(provider) if provider else None
+    if norm_p == "gemini":
+        return True
+    if norm_p == "openrouter":
+        if not model_name:
+            return True
+        clean = model_name.strip().lower()
+        if clean in OPENROUTER_PRICING_MODELS or f"openrouter/{clean}" in MODEL_PRICING:
+            return False
+        return True
     if not model_name:
         return False
     clean = model_name.strip().lower()
-    if provider and normalize_provider_name(provider) == "gemini":
-        return True
     if "gemini" in clean or clean in UNVERIFIED_PRICING_MODELS:
         return True
     return False
@@ -84,7 +96,7 @@ SYSTEM_PROMPT = """You control a web browser to achieve the user's goal. Follow 
 7. The observation includes Page text; read error messages from there.
 8. Use select_option for dropdowns, never click.
 9. All interactive elements are already listed. Do not scroll unless an expected element is missing. For the cart, use the link labelled cart; for checkout, use the checkout button.
-10. Use ask_user ONLY before an irreversible action (placing an order, payment, sending). Never ask the user for credentials or details already given in the goal.
+10. Use ask_user ONLY before an irreversible action (placing an order, payment, sending). Never ask the user for credentials or details already given in the goal. Never call ask_user on the first step or before you have looked at the page. Use ask_user only right before an irreversible action.
 11. If the goal is to report something (e.g. an error message), call finish(success=true) with that exact text in summary."""
 
 # Canonical tool definition list (JSON schema) with required "reasoning" on every tool
@@ -334,9 +346,16 @@ def get_provider(
             client=client,
             max_retries=max_retries,
         )
+    elif normalized in ("openrouter",):
+        return OpenRouterProvider(
+            model_name=model_name,
+            api_key=api_key,
+            client=client,
+            max_retries=max_retries,
+        )
     else:
         raise LLMError(
-            f"Unsupported provider '{provider_name}'. Supported providers: 'anthropic', 'gemini', 'groq'."
+            f"Unsupported provider '{provider_name}'. Supported providers: 'anthropic', 'gemini', 'groq', 'openrouter'."
         )
 
 
@@ -395,7 +414,7 @@ EXHAUSTED_PROVIDERS: Dict[str, float] = {}  # normalized provider name -> expiry
 
 
 def normalize_provider_name(provider_name: str) -> str:
-    """Normalizes provider aliases to canonical names ('groq', 'gemini', 'anthropic')."""
+    """Normalizes provider aliases to canonical names ('groq', 'gemini', 'anthropic', 'openrouter')."""
     p = (provider_name or "").strip().lower()
     if p in ("groq", "grok", "xai"):
         return "groq"
@@ -403,6 +422,8 @@ def normalize_provider_name(provider_name: str) -> str:
         return "gemini"
     if p in ("anthropic", "claude"):
         return "anthropic"
+    if p in ("openrouter",):
+        return "openrouter"
     return p
 
 
@@ -431,6 +452,13 @@ def get_model_for_provider(provider_name: str, fallback_model: Optional[str] = N
             or fallback_model
             or os.getenv("MODEL_NAME")
             or "claude-sonnet-5-5"
+        )
+    elif norm == "openrouter":
+        return (
+            os.getenv("MODEL_NAME_OPENROUTER")
+            or fallback_model
+            or os.getenv("MODEL_NAME")
+            or "openai/gpt-oss-120b"
         )
     return fallback_model or os.getenv("MODEL_NAME") or "default"
 
@@ -469,7 +497,7 @@ def reset_provider_exhaustion(provider_name: Optional[str] = None) -> None:
 
 def get_provider_priority() -> List[str]:
     """Returns ordered list of canonical provider names from PROVIDER_PRIORITY."""
-    raw = os.getenv("PROVIDER_PRIORITY", "groq,gemini")
+    raw = os.getenv("PROVIDER_PRIORITY", "groq,gemini,openrouter")
     return [normalize_provider_name(p.strip()) for p in raw.split(",") if p.strip()]
 
 
@@ -570,6 +598,7 @@ __all__ = [
     "GeminiProvider",
     "GroqProvider",
     "GrokProvider",
+    "OpenRouterProvider",
     "MODEL_PRICING",
     "UNVERIFIED_PRICING_MODELS",
     "is_price_unverified",
