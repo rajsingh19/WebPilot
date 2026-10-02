@@ -144,4 +144,5 @@ python -m evals.run_evals --provider openrouter --repeat 1
 
 ## Documentation
 
-- [Bug 001 Postmortem](browser-agent-evals/docs/bug_001.md): Detailed trace analysis and root cause breakdown for checkout overview interception.
+- [System Architecture & Feature Deep Dive](docs/ARCHITECTURE.md): Complete end-to-end architecture, perception pipeline, failover logic, and guardrails.
+- [Bug 001 Postmortem](docs/bug_001.md): Detailed trace analysis and root cause breakdown for checkout overview interception.
